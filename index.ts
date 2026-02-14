@@ -6,7 +6,7 @@ import http from "http";
 const LOGIN_URL =
   "https://www.tds.ms/CentralizeSP/Student/Login/chelmsfordautoschool";
 const SCHEDULE_URL =
-  "https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1";
+  "https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=1";
 
 const USERNAME = process.env.TDS_USERNAME!;
 const PASSWORD = process.env.TDS_PASSWORD!;
@@ -17,6 +17,9 @@ const MAX_PAGES = 20; // scan all pagination pages
 const ALERT_EMAIL = process.env.ALERT_EMAIL!;
 const EMAIL_USER = process.env.EMAIL_USER!;
 const EMAIL_PASS = process.env.EMAIL_PASS!;
+
+// Unique topic for push notifications (fallback when SMTP blocked)
+const NTFY_TOPIC = process.env.NTFY_TOPIC || "driving-booker-ariel-orlov";
 
 // ── Types ───────────────────────────────────────────────────────────────────
 interface Slot {
@@ -83,23 +86,39 @@ function log(msg: string): void {
   console.log(`[${timestamp()}] ${msg}`);
 }
 
-// ── Email failsafe ──────────────────────────────────────────────────────────
+// ── Notifications ──────────────────────────────────────────────────────────
 
-async function sendEmail(subject: string, body: string): Promise<void> {
-  if (!EMAIL_USER || !EMAIL_PASS) {
-    log(`EMAIL NOT CONFIGURED — would have sent: "${subject}"`);
-    return;
+async function sendPushNotification(title: string, body: string): Promise<boolean> {
+  try {
+    const resp = await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
+      method: "POST",
+      headers: { "Title": title, "Priority": "high" },
+      body,
+    });
+    if (resp.ok) {
+      log(`Push notification sent: "${title}"`);
+      return true;
+    }
+    log(`Push notification failed: ${resp.status}`);
+    return false;
+  } catch (err) {
+    log(`Push notification error: ${err}`);
+    return false;
   }
+}
+
+async function sendEmail(subject: string, body: string): Promise<boolean> {
+  if (!EMAIL_USER || !EMAIL_PASS) return false;
 
   try {
     const transporter = nodemailer.createTransport({
       host: "smtp.gmail.com",
-      port: 587,
-      secure: false,
+      port: 465,
+      secure: true,
       auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-      connectionTimeout: 15_000,
-      greetingTimeout: 15_000,
-      socketTimeout: 15_000,
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 10_000,
     });
 
     await transporter.sendMail({
@@ -110,8 +129,18 @@ async function sendEmail(subject: string, body: string): Promise<void> {
     });
 
     log(`Email sent: "${subject}"`);
+    return true;
   } catch (emailErr) {
-    log(`Failed to send email: ${emailErr}`);
+    log(`Email failed (SMTP blocked?): ${emailErr}`);
+    return false;
+  }
+}
+
+async function notify(title: string, body: string): Promise<void> {
+  // Try email first, fall back to push notification
+  const emailSent = await sendEmail(title, body);
+  if (!emailSent) {
+    await sendPushNotification(title, body);
   }
 }
 
@@ -119,9 +148,9 @@ async function sendErrorAlert(error: unknown, context: string): Promise<void> {
   const msg = error instanceof Error ? error.message : String(error);
   const stack = error instanceof Error ? error.stack ?? "" : "";
 
-  await sendEmail(
+  await notify(
     `Driving Booker Error: ${context}`,
-    `An error occurred in the driving lesson booker.\n\nContext: ${context}\nError: ${msg}\n\nStack:\n${stack}\n\nTime: ${new Date().toISOString()}`
+    `Error: ${msg}\n\nContext: ${context}\nStack:\n${stack}\nTime: ${new Date().toISOString()}`
   );
 }
 
@@ -154,18 +183,7 @@ async function login(page: Page): Promise<void> {
 
 async function navigateToSchedule(page: Page): Promise<void> {
   log("Navigating to Schedule My Drive...");
-  await page.goto(SCHEDULE_URL, { waitUntil: "networkidle2" });
-
-  // Click the "Schedule My Drive" tab
-  await page.evaluate(() => {
-    const links = document.querySelectorAll("a");
-    for (const link of links) {
-      if (link.textContent?.includes("Schedule My Drive")) {
-        link.click();
-        return;
-      }
-    }
-  });
+  await page.goto(SCHEDULE_URL, { waitUntil: "networkidle2", timeout: 30_000 });
 
   // Wait for the slots table to appear
   await page.waitForSelector("table tbody tr", { timeout: 15_000 }).catch(() => {
@@ -197,128 +215,41 @@ async function scrapeCurrentPage(page: Page, pageNum: number): Promise<Slot[]> {
   }, pageNum);
 }
 
-async function clickNextPage(page: Page): Promise<boolean> {
-  try {
-    const clicked = await page.evaluate(() => {
-      // Strategy 1: Look for a "Next" or ">" or ">>" link/button
-      const allLinks = document.querySelectorAll("a, button");
-      for (const el of allLinks) {
-        const text = el.textContent?.trim() ?? "";
-        if (text === ">" || text === ">>" || text === "Next" || text === "Next >" || text === "›" || text === "»") {
-          (el as HTMLElement).click();
-          return "next";
-        }
-      }
-
-      // Strategy 2: Look for pagination links (numbered) and click the "active + 1"
-      const paginationLinks = document.querySelectorAll(".pagination a, .pager a, nav a, ul.pagination li a, [class*='pag'] a");
-      const active = document.querySelector(".pagination .active, .pager .active, ul.pagination li.active, [class*='pag'] .active");
-      if (active) {
-        const activeNum = parseInt(active.textContent?.trim() ?? "0", 10);
-        for (const link of paginationLinks) {
-          const num = parseInt(link.textContent?.trim() ?? "0", 10);
-          if (num === activeNum + 1) {
-            (link as HTMLElement).click();
-            return `page-${num}`;
-          }
-        }
-      }
-
-      // Strategy 3: Look for any link with page= in the href
-      const pageLinks = document.querySelectorAll('a[href*="page="], a[href*="Page="]');
-      const currentPage = document.querySelector('a[href*="page="].active, a[href*="page="].current, .active a[href*="page="], .current a[href*="page="]');
-      const currentNum = currentPage ? parseInt(currentPage.textContent?.trim() ?? "1", 10) : 1;
-      for (const link of pageLinks) {
-        const href = (link as HTMLAnchorElement).href;
-        const match = href.match(/[Pp]age=(\d+)/);
-        if (match && parseInt(match[1], 10) === currentNum + 1) {
-          (link as HTMLElement).click();
-          return `href-page-${match[1]}`;
-        }
-      }
-
-      return null;
-    });
-
-    if (clicked) {
-      log(`  Pagination: clicked via "${clicked}" strategy`);
-      await sleep(2500);
-      return true;
-    }
-
-    // Log what pagination elements exist for debugging
-    const debugInfo = await page.evaluate(() => {
-      const allLinks = document.querySelectorAll("a");
-      const pageish: string[] = [];
-      for (const a of allLinks) {
-        const href = (a as HTMLAnchorElement).href;
-        const text = a.textContent?.trim() ?? "";
-        if (/page|pag|next|prev|\d+/i.test(text) && text.length < 20) {
-          pageish.push(`"${text}" → ${href}`);
-        }
-      }
-      return pageish.slice(0, 10);
-    });
-    if (debugInfo.length > 0) {
-      log(`  Pagination debug - found links: ${JSON.stringify(debugInfo)}`);
-    } else {
-      log("  No pagination links found on page.");
-    }
-
-    return false;
-  } catch {
-    return false;
-  }
-}
-
 async function scrapeAllSlots(page: Page): Promise<Slot[]> {
+  const seen = new Set<string>();
   const allSlots: Slot[] = [];
 
-  // Scrape page 1 (already loaded)
-  const page1Slots = await scrapeCurrentPage(page, 1);
-  allSlots.push(...page1Slots);
-  log(`  Page 1: ${page1Slots.length} slots`);
-
-  // Dump page HTML below table for pagination debugging
-  const paginationHtml = await page.evaluate(() => {
-    // Get everything after the table
-    const table = document.querySelector("table");
-    if (table && table.parentElement) {
-      return table.parentElement.innerHTML.substring(
-        table.parentElement.innerHTML.indexOf("</table>") + 8,
-        table.parentElement.innerHTML.indexOf("</table>") + 2000
-      );
+  function addSlots(slots: Slot[]) {
+    let newCount = 0;
+    for (const slot of slots) {
+      const key = `${slot.dateText}|${slot.instructor}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        allSlots.push(slot);
+        newCount++;
+      }
     }
-    // Fallback: get the full body HTML and look for pagination clues
-    const body = document.body.innerHTML;
-    const lower = body.toLowerCase();
-    const pagIdx = Math.max(lower.indexOf("pagination"), lower.indexOf("pager"), lower.indexOf("page-link"));
-    if (pagIdx > -1) return body.substring(Math.max(0, pagIdx - 200), pagIdx + 500);
-    return "NO TABLE OR PAGINATION FOUND - body length: " + body.length;
-  });
-  log(`PAGINATION HTML DUMP:\n${paginationHtml}`);
-
-  // Also dump all links on page
-  const allLinksOnPage = await page.evaluate(() => {
-    return Array.from(document.querySelectorAll("a")).map(a => ({
-      text: a.textContent?.trim()?.substring(0, 50) ?? "",
-      href: a.getAttribute("href") ?? "",
-      cls: a.className
-    })).filter(l => l.text.length > 0 && l.text.length < 30);
-  });
-  log(`ALL LINKS ON PAGE (${allLinksOnPage.length}):`);
-  for (const l of allLinksOnPage) {
-    log(`  "${l.text}" href="${l.href}" class="${l.cls}"`);
+    return newCount;
   }
 
-  // Scrape remaining pages by clicking "next"
+  // Page 1 is already loaded
+  const page1Slots = await scrapeCurrentPage(page, 1);
+  addSlots(page1Slots);
+  log(`  Page 1: ${page1Slots.length} slots`);
+
+  // Navigate directly to each subsequent page via URL
   for (let p = 2; p <= MAX_PAGES; p++) {
-    const navigated = await clickNextPage(page);
-    if (!navigated) break;
-    const pageSlots = await scrapeCurrentPage(page, p);
-    log(`  Page ${p}: ${pageSlots.length} slots`);
-    if (pageSlots.length === 0) break;
-    allSlots.push(...pageSlots);
+    try {
+      await page.goto(`${SCHEDULE_URL}&page=${p}`, { waitUntil: "networkidle2", timeout: 15_000 });
+      await sleep(1000);
+      const pageSlots = await scrapeCurrentPage(page, p);
+      const newCount = addSlots(pageSlots);
+      log(`  Page ${p}: ${pageSlots.length} slots (${newCount} new, ${allSlots.length} unique total)`);
+      if (pageSlots.length === 0) break;
+    } catch {
+      log(`  Page ${p}: failed to load, stopping.`);
+      break;
+    }
   }
 
   return allSlots;
@@ -352,13 +283,10 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
   try {
     log(`Attempting to book: ${slot.dateText} with ${slot.instructor} (pickup: ${pickup})`);
 
-    // Re-navigate to schedule page (resets to page 1)
-    await navigateToSchedule(page);
-
-    // Click through to the right page
-    for (let p = 2; p <= slot.page; p++) {
-      await clickNextPage(page);
-    }
+    // Navigate directly to the page containing this slot
+    const url = slot.page > 1 ? `${SCHEDULE_URL}&page=${slot.page}` : SCHEDULE_URL;
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 15_000 });
+    await sleep(2000);
 
     // Find and click the slot link
     const slotLinks = await page.$$("table tbody tr td:first-child a");
@@ -382,34 +310,21 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
     await sleep(1500);
 
     // Select pickup location
-    if (pickup === "Home") {
-      await page.evaluate(() => {
-        const radios = document.querySelectorAll('input[type="radio"]');
-        for (const radio of radios) {
-          const label = radio.closest("li")?.textContent?.trim();
-          if (label && label.includes("Home")) {
-            (radio as HTMLInputElement).click();
-            break;
-          }
+    await page.evaluate((pickupType) => {
+      const radios = document.querySelectorAll('input[type="radio"]');
+      for (const radio of radios) {
+        const label = radio.closest("li")?.textContent?.trim();
+        if (label && label.includes(pickupType)) {
+          (radio as HTMLInputElement).click();
+          break;
         }
-      });
-    } else {
-      await page.evaluate(() => {
-        const radios = document.querySelectorAll('input[type="radio"]');
-        for (const radio of radios) {
-          const label = radio.closest("li")?.textContent?.trim();
-          if (label && label.includes("High School")) {
-            (radio as HTMLInputElement).click();
-            break;
-          }
-        }
-      });
-    }
+      }
+    }, pickup);
 
     await sleep(500);
 
     // Click "Schedule Lesson"
-    const clicked2 = await page.evaluate(() => {
+    const scheduled = await page.evaluate(() => {
       const buttons = document.querySelectorAll("button");
       for (const btn of buttons) {
         if (btn.textContent?.trim() === "Schedule Lesson") {
@@ -420,7 +335,7 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
       return false;
     });
 
-    if (!clicked2) {
+    if (!scheduled) {
       log("Schedule Lesson button not found.");
       return false;
     }
@@ -454,7 +369,7 @@ async function openBrowserAndScan(): Promise<boolean> {
     await navigateToSchedule(page);
 
     const allSlots = await scrapeAllSlots(page);
-    log(`Found ${allSlots.length} total slots across ${Math.max(...allSlots.map(s => s.page), 0)} page(s).`);
+    log(`Found ${allSlots.length} unique slots across all pages.`);
 
     if (allSlots.length > 0) {
       log("All available slots:");
@@ -483,7 +398,7 @@ async function openBrowserAndScan(): Promise<boolean> {
       const success = await bookSlot(page, slot, pickup);
       if (success) {
         log("Lesson booked successfully!");
-        await sendEmail(
+        await notify(
           "Driving Lesson Booked!",
           `Successfully booked:\n\n${slot.dateText}\nInstructor: ${slot.instructor}\nPickup: ${pickup}\n\nTime: ${new Date().toISOString()}`
         );
@@ -506,8 +421,8 @@ async function main(): Promise<void> {
 
   log("Starting driving lesson booker...");
 
-  // Verify email works on startup
-  await sendEmail(
+  // Verify notifications work on startup
+  await notify(
     "Driving Booker Started",
     `The driving lesson booker is now running.\n\nTime: ${new Date().toISOString()}`
   );
