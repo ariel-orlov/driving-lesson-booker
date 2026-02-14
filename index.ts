@@ -183,7 +183,23 @@ async function login(page: Page): Promise<void> {
 
 async function navigateToSchedule(page: Page): Promise<void> {
   log("Navigating to Schedule My Drive...");
-  await page.goto(SCHEDULE_URL, { waitUntil: "networkidle2", timeout: 30_000 });
+  // Go to My Schedule first, then click the Schedule My Drive tab
+  // (the tab click sets server-side session state needed for pagination)
+  await page.goto("https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1", {
+    waitUntil: "networkidle2",
+    timeout: 30_000,
+  });
+
+  // Click the "Schedule My Drive" tab
+  await page.evaluate(() => {
+    const links = document.querySelectorAll("a");
+    for (const link of links) {
+      if (link.textContent?.includes("Schedule My Drive")) {
+        link.click();
+        return;
+      }
+    }
+  });
 
   // Wait for the slots table to appear
   await page.waitForSelector("table tbody tr", { timeout: 15_000 }).catch(() => {
