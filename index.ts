@@ -1,5 +1,4 @@
 import puppeteer, { type Page } from "puppeteer";
-import nodemailer from "nodemailer";
 import http from "http";
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -14,12 +13,7 @@ const PASSWORD = process.env.TDS_PASSWORD!;
 const POLL_INTERVAL_MS = 3 * 60_000; // check every 3 minutes
 const MAX_PAGES = 20; // scan all pagination pages
 
-const ALERT_EMAIL = process.env.ALERT_EMAIL!;
-const EMAIL_USER = process.env.EMAIL_USER!;
-const EMAIL_PASS = process.env.EMAIL_PASS!;
-
-// Unique topic for push notifications (fallback when SMTP blocked)
-const NTFY_TOPIC = process.env.NTFY_TOPIC || "driving-booker-ariel-orlov";
+const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK!;
 
 // ── Types ───────────────────────────────────────────────────────────────────
 interface Slot {
@@ -88,59 +82,28 @@ function log(msg: string): void {
 
 // ── Notifications ──────────────────────────────────────────────────────────
 
-async function sendPushNotification(title: string, body: string): Promise<boolean> {
-  try {
-    const resp = await fetch(`https://ntfy.sh/${NTFY_TOPIC}`, {
-      method: "POST",
-      headers: { "Title": title, "Priority": "high" },
-      body,
-    });
-    if (resp.ok) {
-      log(`Push notification sent: "${title}"`);
-      return true;
-    }
-    log(`Push notification failed: ${resp.status}`);
-    return false;
-  } catch (err) {
-    log(`Push notification error: ${err}`);
-    return false;
-  }
-}
-
-async function sendEmail(subject: string, body: string): Promise<boolean> {
-  if (!EMAIL_USER || !EMAIL_PASS) return false;
-
-  try {
-    const transporter = nodemailer.createTransport({
-      host: "smtp.gmail.com",
-      port: 465,
-      secure: true,
-      auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-      connectionTimeout: 10_000,
-      greetingTimeout: 10_000,
-      socketTimeout: 10_000,
-    });
-
-    await transporter.sendMail({
-      from: EMAIL_USER,
-      to: ALERT_EMAIL,
-      subject,
-      text: body,
-    });
-
-    log(`Email sent: "${subject}"`);
-    return true;
-  } catch (emailErr) {
-    log(`Email failed (SMTP blocked?): ${emailErr}`);
-    return false;
-  }
-}
-
 async function notify(title: string, body: string): Promise<void> {
-  // Try email first, fall back to push notification
-  const emailSent = await sendEmail(title, body);
-  if (!emailSent) {
-    await sendPushNotification(title, body);
+  if (!DISCORD_WEBHOOK) {
+    log(`NO DISCORD WEBHOOK — would have sent: "${title}"`);
+    return;
+  }
+  try {
+    const fs = await import("fs");
+    const tmpFile = `/tmp/discord_${Date.now()}.json`;
+    fs.writeFileSync(tmpFile, JSON.stringify({ content: `**${title}**\n${body}` }));
+    const resp = await fetch(DISCORD_WEBHOOK, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: fs.readFileSync(tmpFile, "utf-8"),
+    });
+    fs.unlinkSync(tmpFile);
+    if (resp.ok || resp.status === 204) {
+      log(`Discord notification sent: "${title}"`);
+    } else {
+      log(`Discord notification failed: ${resp.status}`);
+    }
+  } catch (err) {
+    log(`Discord notification error: ${err}`);
   }
 }
 
