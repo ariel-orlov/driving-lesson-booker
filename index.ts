@@ -93,11 +93,13 @@ async function sendEmail(subject: string, body: string): Promise<void> {
 
   try {
     const transporter = nodemailer.createTransport({
-      service: "gmail",
+      host: "smtp.gmail.com",
+      port: 587,
+      secure: false,
       auth: { user: EMAIL_USER, pass: EMAIL_PASS },
-      connectionTimeout: 10_000,
-      greetingTimeout: 10_000,
-      socketTimeout: 10_000,
+      connectionTimeout: 15_000,
+      greetingTimeout: 15_000,
+      socketTimeout: 15_000,
     });
 
     await transporter.sendMail({
@@ -276,6 +278,38 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   const page1Slots = await scrapeCurrentPage(page, 1);
   allSlots.push(...page1Slots);
   log(`  Page 1: ${page1Slots.length} slots`);
+
+  // Dump page HTML below table for pagination debugging
+  const paginationHtml = await page.evaluate(() => {
+    // Get everything after the table
+    const table = document.querySelector("table");
+    if (table && table.parentElement) {
+      return table.parentElement.innerHTML.substring(
+        table.parentElement.innerHTML.indexOf("</table>") + 8,
+        table.parentElement.innerHTML.indexOf("</table>") + 2000
+      );
+    }
+    // Fallback: get the full body HTML and look for pagination clues
+    const body = document.body.innerHTML;
+    const lower = body.toLowerCase();
+    const pagIdx = Math.max(lower.indexOf("pagination"), lower.indexOf("pager"), lower.indexOf("page-link"));
+    if (pagIdx > -1) return body.substring(Math.max(0, pagIdx - 200), pagIdx + 500);
+    return "NO TABLE OR PAGINATION FOUND - body length: " + body.length;
+  });
+  log(`PAGINATION HTML DUMP:\n${paginationHtml}`);
+
+  // Also dump all links on page
+  const allLinksOnPage = await page.evaluate(() => {
+    return Array.from(document.querySelectorAll("a")).map(a => ({
+      text: a.textContent?.trim()?.substring(0, 50) ?? "",
+      href: a.getAttribute("href") ?? "",
+      cls: a.className
+    })).filter(l => l.text.length > 0 && l.text.length < 30);
+  });
+  log(`ALL LINKS ON PAGE (${allLinksOnPage.length}):`);
+  for (const l of allLinksOnPage) {
+    log(`  "${l.text}" href="${l.href}" class="${l.cls}"`);
+  }
 
   // Scrape remaining pages by clicking "next"
   for (let p = 2; p <= MAX_PAGES; p++) {
