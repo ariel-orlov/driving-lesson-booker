@@ -95,6 +95,9 @@ async function sendEmail(subject: string, body: string): Promise<void> {
     const transporter = nodemailer.createTransport({
       service: "gmail",
       auth: { user: EMAIL_USER, pass: EMAIL_PASS },
+      connectionTimeout: 10_000,
+      greetingTimeout: 10_000,
+      socketTimeout: 10_000,
     });
 
     await transporter.sendMail({
@@ -192,13 +195,75 @@ async function scrapeCurrentPage(page: Page, pageNum: number): Promise<Slot[]> {
   }, pageNum);
 }
 
-async function goToPage(page: Page, pageNum: number): Promise<boolean> {
+async function clickNextPage(page: Page): Promise<boolean> {
   try {
-    const pageLink = await page.$(`a[href*="RefineSearch?page=${pageNum}"]`);
-    if (!pageLink) return false;
-    await pageLink.click();
-    await sleep(2000);
-    return true;
+    const clicked = await page.evaluate(() => {
+      // Strategy 1: Look for a "Next" or ">" or ">>" link/button
+      const allLinks = document.querySelectorAll("a, button");
+      for (const el of allLinks) {
+        const text = el.textContent?.trim() ?? "";
+        if (text === ">" || text === ">>" || text === "Next" || text === "Next >" || text === "›" || text === "»") {
+          (el as HTMLElement).click();
+          return "next";
+        }
+      }
+
+      // Strategy 2: Look for pagination links (numbered) and click the "active + 1"
+      const paginationLinks = document.querySelectorAll(".pagination a, .pager a, nav a, ul.pagination li a, [class*='pag'] a");
+      const active = document.querySelector(".pagination .active, .pager .active, ul.pagination li.active, [class*='pag'] .active");
+      if (active) {
+        const activeNum = parseInt(active.textContent?.trim() ?? "0", 10);
+        for (const link of paginationLinks) {
+          const num = parseInt(link.textContent?.trim() ?? "0", 10);
+          if (num === activeNum + 1) {
+            (link as HTMLElement).click();
+            return `page-${num}`;
+          }
+        }
+      }
+
+      // Strategy 3: Look for any link with page= in the href
+      const pageLinks = document.querySelectorAll('a[href*="page="], a[href*="Page="]');
+      const currentPage = document.querySelector('a[href*="page="].active, a[href*="page="].current, .active a[href*="page="], .current a[href*="page="]');
+      const currentNum = currentPage ? parseInt(currentPage.textContent?.trim() ?? "1", 10) : 1;
+      for (const link of pageLinks) {
+        const href = (link as HTMLAnchorElement).href;
+        const match = href.match(/[Pp]age=(\d+)/);
+        if (match && parseInt(match[1], 10) === currentNum + 1) {
+          (link as HTMLElement).click();
+          return `href-page-${match[1]}`;
+        }
+      }
+
+      return null;
+    });
+
+    if (clicked) {
+      log(`  Pagination: clicked via "${clicked}" strategy`);
+      await sleep(2500);
+      return true;
+    }
+
+    // Log what pagination elements exist for debugging
+    const debugInfo = await page.evaluate(() => {
+      const allLinks = document.querySelectorAll("a");
+      const pageish: string[] = [];
+      for (const a of allLinks) {
+        const href = (a as HTMLAnchorElement).href;
+        const text = a.textContent?.trim() ?? "";
+        if (/page|pag|next|prev|\d+/i.test(text) && text.length < 20) {
+          pageish.push(`"${text}" → ${href}`);
+        }
+      }
+      return pageish.slice(0, 10);
+    });
+    if (debugInfo.length > 0) {
+      log(`  Pagination debug - found links: ${JSON.stringify(debugInfo)}`);
+    } else {
+      log("  No pagination links found on page.");
+    }
+
+    return false;
   } catch {
     return false;
   }
@@ -210,12 +275,14 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   // Scrape page 1 (already loaded)
   const page1Slots = await scrapeCurrentPage(page, 1);
   allSlots.push(...page1Slots);
+  log(`  Page 1: ${page1Slots.length} slots`);
 
-  // Scrape all remaining pages
+  // Scrape remaining pages by clicking "next"
   for (let p = 2; p <= MAX_PAGES; p++) {
-    const navigated = await goToPage(page, p);
+    const navigated = await clickNextPage(page);
     if (!navigated) break;
     const pageSlots = await scrapeCurrentPage(page, p);
+    log(`  Page ${p}: ${pageSlots.length} slots`);
     if (pageSlots.length === 0) break;
     allSlots.push(...pageSlots);
   }
@@ -251,16 +318,12 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
   try {
     log(`Attempting to book: ${slot.dateText} with ${slot.instructor} (pickup: ${pickup})`);
 
-    // If not on the right page, navigate to it
-    if (slot.page > 1) {
-      await goToPage(page, slot.page);
-    } else {
-      // Go back to page 1
-      const page1Link = await page.$('a[href*="RefineSearch?page=1"]');
-      if (page1Link) {
-        await page1Link.click();
-        await sleep(2000);
-      }
+    // Re-navigate to schedule page (resets to page 1)
+    await navigateToSchedule(page);
+
+    // Click through to the right page
+    for (let p = 2; p <= slot.page; p++) {
+      await clickNextPage(page);
     }
 
     // Find and click the slot link
