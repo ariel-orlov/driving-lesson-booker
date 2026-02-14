@@ -1,5 +1,6 @@
 import puppeteer, { type Page } from "puppeteer";
 import nodemailer from "nodemailer";
+import http from "http";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const LOGIN_URL =
@@ -381,16 +382,17 @@ async function openBrowserAndScan(): Promise<boolean> {
       log(`  - ${slot.dateText} | ${slot.instructor} | pickup: ${pickup}`);
     }
 
-    const first = eligibleSlots[0];
-    const success = await bookSlot(page, first.slot, first.pickup);
-    if (success) {
-      log("Lesson booked successfully!");
-      await sendEmail(
-        "Driving Lesson Booked!",
-        `Successfully booked:\n\n${first.slot.dateText}\nInstructor: ${first.slot.instructor}\nPickup: ${first.pickup}\n\nTime: ${new Date().toISOString()}`
-      );
+    for (const { slot, pickup } of eligibleSlots) {
+      const success = await bookSlot(page, slot, pickup);
+      if (success) {
+        log("Lesson booked successfully!");
+        await sendEmail(
+          "Driving Lesson Booked!",
+          `Successfully booked:\n\n${slot.dateText}\nInstructor: ${slot.instructor}\nPickup: ${pickup}\n\nTime: ${new Date().toISOString()}`
+        );
+      }
     }
-    return success;
+    return false; // keep polling for more slots
   } finally {
     await browser.close();
     log("Browser closed.");
@@ -398,7 +400,20 @@ async function openBrowserAndScan(): Promise<boolean> {
 }
 
 async function main(): Promise<void> {
+  // Health check server so Railway doesn't kill the container
+  const port = process.env.PORT || 3000;
+  http.createServer((_req, res) => {
+    res.writeHead(200);
+    res.end("running");
+  }).listen(port, () => log(`Health server listening on port ${port}`));
+
   log("Starting driving lesson booker...");
+
+  // Verify email works on startup
+  await sendEmail(
+    "Driving Booker Started",
+    `The driving lesson booker is now running.\n\nTime: ${new Date().toISOString()}`
+  );
 
   let booked = false;
 
