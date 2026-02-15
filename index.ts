@@ -69,6 +69,13 @@ function parseSlotDate(dateText: string): { dayOfWeek: string; month: number; da
   return { dayOfWeek, month, day, hour, minute };
 }
 
+/** Normalize a date string into a comparable key like "3-3-17-0" (month-day-hour-minute). */
+function slotDateKey(dateText: string): string | null {
+  const parsed = parseSlotDate(dateText);
+  if (!parsed) return null;
+  return `${parsed.month}-${parsed.day}-${parsed.hour}-${parsed.minute}`;
+}
+
 function isBlackedOut(slot: Slot): boolean {
   const parsed = parseSlotDate(slot.dateText);
   if (!parsed) return false;
@@ -288,61 +295,78 @@ async function navigateToSchedule(page: Page): Promise<void> {
 }
 
 async function scrapeBookedLessons(page: Page): Promise<Set<string>> {
-  const bookedDates = new Set<string>();
+  const bookedKeys = new Set<string>();
 
   try {
     log("Checking already-booked lessons...");
-    await page.goto(BOOKED_LESSONS_URL, { waitUntil: "networkidle2", timeout: 30_000 });
-    await page.waitForSelector("table", { timeout: 10_000 }).catch(() => {});
-    await sleep(1000);
+    await ensurePageReady(page);
 
-    const booked = await page.evaluate(() => {
-      const rows = document.querySelectorAll("table tbody tr");
-      const lessons: string[] = [];
-      rows.forEach((row) => {
-        const cells = row.querySelectorAll("td");
-        if (cells.length >= 2) {
-          const dateText = cells[0]?.textContent?.trim() ?? "";
-          if (dateText && /\w{3},\s+\w{3}\s+\d/.test(dateText)) {
-            lessons.push(dateText);
-          }
+    // Navigate to the scheduling page (same base as available slots)
+    const url = "https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1";
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 30_000 });
+
+    // Click the "My Schedule" tab using trusted mouse click + wait for XHR
+    const mySchedLink = await page.evaluateHandle(() => {
+      const links = document.querySelectorAll("a");
+      for (const link of links) {
+        const text = link.textContent?.trim() ?? "";
+        if (text.includes("My Schedule")) {
+          link.scrollIntoView({ block: "center" });
+          return link;
         }
-      });
-      return lessons;
+      }
+      return null;
     });
 
-    // Handle pagination on booked lessons page
-    const maxPage = await getMaxPage(page);
-    if (maxPage > 1) {
-      for (let p = 2; p <= maxPage; p++) {
-        const navigated = await goToPage(page, p);
-        if (!navigated) break;
+    const mySchedElement = mySchedLink.asElement();
+    if (!mySchedElement) {
+      log("Could not find 'My Schedule' tab — skipping booked lessons check.");
+      return bookedKeys;
+    }
 
-        const pageBooked = await page.evaluate(() => {
-          const rows = document.querySelectorAll("table tbody tr");
-          const lessons: string[] = [];
-          rows.forEach((row) => {
-            const cells = row.querySelectorAll("td");
-            if (cells.length >= 2) {
-              const dateText = cells[0]?.textContent?.trim() ?? "";
-              if (dateText && /\w{3},\s+\w{3}\s+\d/.test(dateText)) {
-                lessons.push(dateText);
-              }
-            }
-          });
-          return lessons;
-        });
-        booked.push(...pageBooked);
+    await sleep(300);
+    const box = await mySchedElement.boundingBox();
+    if (!box) {
+      log("Could not get bounding box for 'My Schedule' tab.");
+      return bookedKeys;
+    }
+
+    // Set up response listener BEFORE clicking
+    const responsePromise = page.waitForResponse(
+      (resp) => {
+        const u = resp.url();
+        return (u.includes("Lessons") || u.includes("BtwScheduling") || u.includes("Schedule"))
+          && resp.request().resourceType() !== "image";
+      },
+      { timeout: 15_000 },
+    ).catch(() => null);
+
+    await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+
+    const resp = await responsePromise;
+    if (resp) {
+      log(`"My Schedule" XHR: ${resp.status()} ${resp.url().substring(0, 100)}`);
+    }
+
+    await sleep(2000);
+    await screenshot(page, "00-my-schedule");
+
+    // The "My Schedule" page uses cards (not a table).
+    // Scrape all text from the page and find date patterns like "TUE, MAR 3, 5:00 PM".
+    const bodyText = await page.evaluate(() => document.body.innerText);
+    const datePattern = /[A-Z]{3},\s+[A-Z]{3}\s+\d{1,2},\s+\d{1,2}:\d{2}\s+[AP]M/gi;
+    const matches = bodyText.match(datePattern) || [];
+
+    for (const match of matches) {
+      const key = slotDateKey(match);
+      if (key) {
+        bookedKeys.add(key);
+        log(`  ↳ Booked: ${match} → key: ${key}`);
       }
     }
 
-    for (const dateText of booked) {
-      bookedDates.add(dateText);
-    }
-
-    if (bookedDates.size > 0) {
-      log(`Found ${bookedDates.size} already-booked lesson(s):`);
-      for (const d of bookedDates) log(`  ↳ ${d}`);
+    if (bookedKeys.size > 0) {
+      log(`Found ${bookedKeys.size} already-booked lesson(s).`);
     } else {
       log("No existing booked lessons found.");
     }
@@ -350,7 +374,7 @@ async function scrapeBookedLessons(page: Page): Promise<Set<string>> {
     log(`Error checking booked lessons: ${err}`);
   }
 
-  return bookedDates;
+  return bookedKeys;
 }
 
 async function scrapeCurrentPage(page: Page, pageNum: number): Promise<Slot[]> {
@@ -736,18 +760,20 @@ async function openBrowserAndScan(): Promise<boolean> {
     await login(page);
 
     // Scrape already-booked lessons so we don't try to re-book them
-    const bookedDates = await scrapeBookedLessons(page);
+    const bookedKeys = await scrapeBookedLessons(page);
 
     await navigateToSchedule(page);
 
     const allSlots = await scrapeAllSlots(page);
 
+    const isAlreadyBooked = (s: Slot) => bookedKeys.has(slotDateKey(s.dateText) ?? "");
+
     const slotsToBook = allSlots
       .map((slot) => ({ slot, ...isEligible(slot) }))
       .filter((s) => s.eligible)
-      .filter((s) => !bookedDates.has(s.slot.dateText));
+      .filter((s) => !isAlreadyBooked(s.slot));
 
-    const alreadyBookedCount = allSlots.filter(s => isEligible(s).eligible && bookedDates.has(s.dateText)).length;
+    const alreadyBookedCount = allSlots.filter(s => isEligible(s).eligible && isAlreadyBooked(s)).length;
     const blackoutCount = allSlots.filter(s => isBlackedOut(s)).length;
     const skippedCount = allSlots.length - slotsToBook.length - blackoutCount - alreadyBookedCount;
 
@@ -776,7 +802,7 @@ async function openBrowserAndScan(): Promise<boolean> {
     const allSlotLines = allSlots
       .map((slot) => {
         const { eligible, pickup } = isEligible(slot);
-        const alreadyBooked = eligible && bookedDates.has(slot.dateText);
+        const alreadyBooked = eligible && isAlreadyBooked(slot);
         const tag = isBlackedOut(slot) ? "🚫" : alreadyBooked ? "📌" : eligible ? "✅" : "⏭️";
         const suffix = alreadyBooked ? " | already booked" : eligible ? ` | ${pickup}` : "";
         return `${tag} ${slot.dateText} | ${slot.instructor}${suffix}`;
@@ -810,7 +836,8 @@ async function openBrowserAndScan(): Promise<boolean> {
       const success = await bookSlot(page, slot, pickup);
       if (success) {
         anyBooked = true;
-        bookedDates.add(slot.dateText);
+        const key = slotDateKey(slot.dateText);
+        if (key) bookedKeys.add(key);
         log("Lesson booked successfully!");
         await notifyAlert(
           `✅ **Driving Lesson Booked!**\n\n` +
