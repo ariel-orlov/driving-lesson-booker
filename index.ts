@@ -14,6 +14,7 @@ const MAX_MONTHS_AHEAD = 4;
 
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
 const DISCORD_ALERT = process.env.DISCORD_WEBHOOK_IMPORTANT!;
+const DISCORD_SCAN = process.env.DISCORD_WEBHOOK_SCAN!;
 
 // ── Blackout dates (don't book during these ranges) ─────────────────────────
 // Format: [month, startDay, endDay] (month is 1-indexed)
@@ -157,6 +158,10 @@ async function notifyLog(message: string): Promise<void> {
 
 async function notifyAlert(message: string): Promise<void> {
   await sendDiscord(DISCORD_ALERT, message);
+}
+
+async function notifyScan(message: string): Promise<void> {
+  await sendDiscord(DISCORD_SCAN, message);
 }
 
 // ── Browser actions ─────────────────────────────────────────────────────────
@@ -674,6 +679,13 @@ async function openBrowserAndScan(): Promise<void> {
     ].join("\n");
 
     await notifyLog(scanMsg);
+
+    // Scan completion ping — confirms every full scan cycle
+    await notifyScan(
+      `✅ Scan complete — ${new Date().toLocaleString("en-US")}\n` +
+      `Checked **${allSlots.length}** slots across **${monthNames.join(", ") || "no months"}**\n` +
+      `${slotsToBook.length} eligible | ${blackoutCount} blacked out | ${skippedCount} skipped`
+    );
 
     if (slotsToBook.length === 0) {
       log("No eligible slots right now. Will keep checking...");
