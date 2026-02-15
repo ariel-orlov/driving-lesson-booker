@@ -13,6 +13,7 @@ const PASSWORD = process.env.TDS_PASSWORD!;
 
 const POLL_INTERVAL_MS = 3 * 60_000;
 const MAX_PAGES = 20;
+const MAX_MONTHS_AHEAD = 4;
 
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
 const DISCORD_ALERT = process.env.DISCORD_WEBHOOK_IMPORTANT!;
@@ -35,6 +36,7 @@ interface Slot {
   instructor: string;
   rowIndex: number;
   page: number;
+  monthOffset: number;
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -193,10 +195,10 @@ async function navigateToSchedule(page: Page): Promise<void> {
   await sleep(2000);
 }
 
-async function scrapeCurrentPage(page: Page, pageNum: number): Promise<Slot[]> {
-  return page.evaluate((pn) => {
+async function scrapeCurrentPage(page: Page, pageNum: number, monthOff: number = 0): Promise<Slot[]> {
+  return page.evaluate((pn, mo) => {
     const rows = document.querySelectorAll("table tbody tr");
-    const slots: Slot[] = [];
+    const slots: { dateText: string; instructor: string; rowIndex: number; page: number; monthOffset: number }[] = [];
 
     rows.forEach((row, idx) => {
       const cells = row.querySelectorAll("td");
@@ -204,13 +206,13 @@ async function scrapeCurrentPage(page: Page, pageNum: number): Promise<Slot[]> {
         const dateText = cells[0]?.textContent?.trim() ?? "";
         const instructor = cells[1]?.textContent?.trim() ?? "";
         if (dateText && /^\w{3},\s+\w{3}\s+\d/.test(dateText)) {
-          slots.push({ dateText, instructor, rowIndex: idx, page: pn });
+          slots.push({ dateText, instructor, rowIndex: idx, page: pn, monthOffset: mo });
         }
       }
     });
 
     return slots;
-  }, pageNum);
+  }, pageNum, monthOff);
 }
 
 async function clickNextPageLink(page: Page): Promise<boolean> {
@@ -257,6 +259,64 @@ async function clickToPage(page: Page, targetPage: number): Promise<boolean> {
   return true;
 }
 
+async function clickNextMonth(page: Page): Promise<boolean> {
+  const clicked = await page.evaluate(() => {
+    // Look for datepicker ">" that is NOT a pagination link (no "page=" in href)
+    const links = document.querySelectorAll("a");
+    for (const link of links) {
+      const href = link.getAttribute("href") || "";
+      const text = link.textContent?.trim() || "";
+      if (text === ">" && !href.includes("page=")) {
+        (link as HTMLElement).click();
+        return "datepicker-arrow";
+      }
+    }
+    // jQuery UI datepicker next button
+    const uiNext = document.querySelector(
+      ".ui-datepicker-next:not(.ui-state-disabled)"
+    ) as HTMLElement | null;
+    if (uiNext) {
+      uiNext.click();
+      return "ui-datepicker";
+    }
+    return null;
+  });
+
+  if (!clicked) return false;
+  log(`Advanced to next month via ${clicked}`);
+  await sleep(2000);
+
+  // Click the first available date in the datepicker to load that month's slots
+  const dateClicked = await page.evaluate(() => {
+    const cell = document.querySelector(
+      ".ui-datepicker td:not(.ui-state-disabled) a, .datepicker td:not(.disabled) a"
+    ) as HTMLElement | null;
+    if (cell) {
+      cell.click();
+      return true;
+    }
+    return false;
+  });
+
+  if (dateClicked) {
+    log("Clicked date cell in datepicker, waiting for table to update...");
+    // Wait for navigation if the date click triggers a page load
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10_000 }).catch(() => {}),
+      sleep(5000),
+    ]);
+  } else {
+    // No date cell found — the month advance itself may have triggered a table update
+    await sleep(3000);
+  }
+
+  await page.waitForSelector("table tbody tr", { timeout: 15_000 }).catch(() => {
+    log("Warning: no slots table found after advancing month.");
+  });
+  await sleep(1000);
+  return true;
+}
+
 async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   const seen = new Set<string>();
   const allSlots: Slot[] = [];
@@ -274,39 +334,61 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     return newCount;
   }
 
-  const page1Slots = await scrapeCurrentPage(page, 1);
-  addSlots(page1Slots);
-  log(`── Page 1: ${page1Slots.length} slots ──`);
-  for (const s of page1Slots) {
-    const { eligible } = isEligible(s);
-    const bo = isBlackedOut(s);
-    const tag = bo ? "BLACKOUT" : eligible ? "ELIGIBLE" : "skip";
-    log(`  [${tag}] ${s.dateText} | ${s.instructor}`);
-  }
-
-  // Click through pagination using actual page links (preserves server session)
-  for (let p = 2; p <= MAX_PAGES; p++) {
-    try {
-      const hasNext = await clickNextPageLink(page);
-      if (!hasNext) {
-        log(`  No more pagination links after page ${p - 1}. Total pages: ${p - 1}`);
+  for (let monthOffset = 0; monthOffset < MAX_MONTHS_AHEAD; monthOffset++) {
+    if (monthOffset > 0) {
+      // Navigate back to schedule so the datepicker is in the DOM
+      await navigateToSchedule(page);
+      let advanced = true;
+      for (let m = 0; m < monthOffset; m++) {
+        if (!await clickNextMonth(page)) {
+          advanced = false;
+          break;
+        }
+      }
+      if (!advanced) {
+        log(`No more months to check after month offset ${monthOffset - 1}.`);
         break;
       }
-      await sleep(1000);
+    }
 
-      const pageSlots = await scrapeCurrentPage(page, p);
-      const newCount = addSlots(pageSlots);
-      log(`── Page ${p}: ${pageSlots.length} slots (${newCount} new, ${allSlots.length} unique total) ──`);
-      for (const s of pageSlots) {
-        const { eligible } = isEligible(s);
-        const bo = isBlackedOut(s);
-        const tag = bo ? "BLACKOUT" : eligible ? "ELIGIBLE" : "skip";
-        log(`  [${tag}] ${s.dateText} | ${s.instructor}`);
-      }
-      if (pageSlots.length === 0) break;
-    } catch (err) {
-      log(`  Page ${p}: failed to load, stopping. Error: ${err}`);
+    const page1Slots = await scrapeCurrentPage(page, 1, monthOffset);
+    if (page1Slots.length === 0 && monthOffset > 0) {
+      log(`No slots found for month offset ${monthOffset}. Done scanning months.`);
       break;
+    }
+    addSlots(page1Slots);
+    log(`── Month +${monthOffset}, Page 1: ${page1Slots.length} slots ──`);
+    for (const s of page1Slots) {
+      const { eligible } = isEligible(s);
+      const bo = isBlackedOut(s);
+      const tag = bo ? "BLACKOUT" : eligible ? "ELIGIBLE" : "skip";
+      log(`  [${tag}] ${s.dateText} | ${s.instructor}`);
+    }
+
+    // Click through pagination within this month
+    for (let p = 2; p <= MAX_PAGES; p++) {
+      try {
+        const hasNext = await clickNextPageLink(page);
+        if (!hasNext) {
+          log(`  No more pagination links after page ${p - 1}.`);
+          break;
+        }
+        await sleep(1000);
+
+        const pageSlots = await scrapeCurrentPage(page, p, monthOffset);
+        const newCount = addSlots(pageSlots);
+        log(`── Month +${monthOffset}, Page ${p}: ${pageSlots.length} slots (${newCount} new, ${allSlots.length} unique total) ──`);
+        for (const s of pageSlots) {
+          const { eligible } = isEligible(s);
+          const bo = isBlackedOut(s);
+          const tag = bo ? "BLACKOUT" : eligible ? "ELIGIBLE" : "skip";
+          log(`  [${tag}] ${s.dateText} | ${s.instructor}`);
+        }
+        if (pageSlots.length === 0) break;
+      } catch (err) {
+        log(`  Page ${p}: failed to load, stopping. Error: ${err}`);
+        break;
+      }
     }
   }
 
@@ -339,8 +421,20 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
   try {
     log(`Attempting to book: ${slot.dateText} with ${slot.instructor} (pickup: ${pickup})`);
 
-    // Navigate via session-preserving method: go to schedule tab, then click through pages
+    // Navigate via session-preserving method: go to schedule tab, advance month, then click through pages
     await navigateToSchedule(page);
+
+    // Advance to the correct month
+    if (slot.monthOffset > 0) {
+      for (let m = 0; m < slot.monthOffset; m++) {
+        const advanced = await clickNextMonth(page);
+        if (!advanced) {
+          log(`Could not advance to month offset ${slot.monthOffset} for booking.`);
+          return false;
+        }
+      }
+    }
+
     if (slot.page > 1) {
       const reached = await clickToPage(page, slot.page);
       if (!reached) {
