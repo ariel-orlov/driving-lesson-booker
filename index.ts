@@ -235,37 +235,21 @@ async function getPageLinks(page: Page): Promise<{ maxPage: number; nextUrl: str
   });
 }
 
-async function clickNextPageLink(page: Page): Promise<boolean> {
-  const clicked = await page.evaluate(() => {
-    const links = document.querySelectorAll("a");
-    for (const link of links) {
-      const text = link.textContent?.trim() || "";
-      const href = link.getAttribute("href") || "";
-      if (text === ">" && href.includes("page=")) {
-        (link as HTMLElement).click();
-        return true;
-      }
-    }
+async function goToPage(page: Page, targetPage: number): Promise<boolean> {
+  const { pageUrls } = await getPageLinks(page);
+  const url = pageUrls[targetPage];
+  if (!url) {
+    log(`No URL found for page ${targetPage}`);
     return false;
-  });
-
-  if (clicked) {
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10_000 }).catch(() => {}),
-      sleep(5000),
-    ]);
-    await sleep(500);
   }
-  return clicked;
+  await page.goto(url, { waitUntil: "networkidle2", timeout: 15_000 });
+  await sleep(500);
+  return true;
 }
 
 async function clickToPage(page: Page, targetPage: number): Promise<boolean> {
-  for (let p = 2; p <= targetPage; p++) {
-    const ok = await clickNextPageLink(page);
-    if (!ok) return false;
-    await sleep(1000);
-  }
-  return true;
+  // Navigate directly to the target page URL
+  return goToPage(page, targetPage);
 }
 
 async function clickNextMonth(page: Page): Promise<boolean> {
@@ -363,20 +347,24 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     const page1Slots = await scrapeCurrentPage(page, 1, 0);
     totalNew += addSlots(page1Slots);
 
-    const { maxPage } = await getPageLinks(page);
+    const { maxPage, pageUrls } = await getPageLinks(page);
     const pageLimit = Math.min(maxPage, MAX_PAGES);
-    log(`${label}: pg 1 → ${page1Slots.length} slots [${monthSummary(page1Slots)}], ${pageLimit} pages total`);
+    log(`${label}: pg 1 → ${page1Slots.length} slots [${monthSummary(page1Slots)}], ${pageLimit} pages`);
 
     for (let p = 2; p <= pageLimit; p++) {
       try {
-        const hasNext = await clickNextPageLink(page);
-        if (!hasNext) break;
+        const url = pageUrls[p];
+        if (!url) {
+          log(`  pg ${p}: no URL found, stopping`);
+          break;
+        }
+        await page.goto(url, { waitUntil: "networkidle2", timeout: 15_000 });
+        await sleep(500);
 
         const pageSlots = await scrapeCurrentPage(page, p, 0);
         const nc = addSlots(pageSlots);
         totalNew += nc;
         log(`  pg ${p}: ${pageSlots.length} slots (${nc} new) [${monthSummary(pageSlots)}]`);
-        if (nc === 0) break; // all duplicates = likely cycling
       } catch (err) {
         log(`  pg ${p} error: ${err}`);
         break;
