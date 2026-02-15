@@ -1203,30 +1203,38 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
       }
     }
 
-    if (slot.page > 1) {
-      const reached = await goToPage(page, slot.page);
-      if (!reached) {
-        log(`Could not navigate to page ${slot.page} for booking.`);
+    // Find and click the slot link — may need to navigate through pages
+    let slotClicked = false;
+    const maxPage = await getMaxPage(page);
+    const pagesToTry = slot.page > 1 ? [slot.page, ...Array.from({ length: maxPage }, (_, i) => i + 1).filter(p => p !== slot.page)] : [1, ...Array.from({ length: maxPage - 1 }, (_, i) => i + 2)];
+
+    for (const p of pagesToTry) {
+      if (p > 1) {
+        const reached = await goToPage(page, p);
+        if (!reached) continue;
+      }
+      await sleep(1000);
+
+      slotClicked = await page.evaluate((targetDate) => {
+        const rows = document.querySelectorAll("table tbody tr");
+        for (const row of rows) {
+          const firstCell = row.querySelector("td:first-child a");
+          if (firstCell && firstCell.textContent?.trim() === targetDate) {
+            (firstCell as HTMLElement).click();
+            return true;
+          }
+        }
         return false;
+      }, slot.dateText);
+
+      if (slotClicked) {
+        log(`Found slot on page ${p}: ${slot.dateText}`);
+        break;
       }
     }
-    await sleep(1000);
-
-    // Find and click the slot link in the table
-    const slotClicked = await page.evaluate((targetDate) => {
-      const rows = document.querySelectorAll("table tbody tr");
-      for (const row of rows) {
-        const firstCell = row.querySelector("td:first-child a");
-        if (firstCell && firstCell.textContent?.trim() === targetDate) {
-          (firstCell as HTMLElement).click();
-          return true;
-        }
-      }
-      return false;
-    }, slot.dateText);
 
     if (!slotClicked) {
-      log(`Could not find slot link for: ${slot.dateText}`);
+      log(`Could not find slot link for: ${slot.dateText} (searched ${pagesToTry.length} pages)`);
       return false;
     }
 
