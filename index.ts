@@ -14,9 +14,6 @@ const PASSWORD = process.env.TDS_PASSWORD!;
 const POLL_INTERVAL_MS = 3 * 60_000;
 const MAX_PAGES = 20;
 
-// Set to true to book the first available slot regardless of eligibility (for testing)
-const TEST_MODE = process.env.TEST_MODE === "true";
-
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
 const DISCORD_ALERT = process.env.DISCORD_WEBHOOK_IMPORTANT!;
 
@@ -235,7 +232,13 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
 
   const page1Slots = await scrapeCurrentPage(page, 1);
   addSlots(page1Slots);
-  log(`  Page 1: ${page1Slots.length} slots`);
+  log(`── Page 1: ${page1Slots.length} slots ──`);
+  for (const s of page1Slots) {
+    const { eligible } = isEligible(s);
+    const bo = isBlackedOut(s);
+    const tag = bo ? "BLACKOUT" : eligible ? "ELIGIBLE" : "skip";
+    log(`  [${tag}] ${s.dateText} | ${s.instructor}`);
+  }
 
   for (let p = 2; p <= MAX_PAGES; p++) {
     try {
@@ -243,7 +246,13 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
       await sleep(1000);
       const pageSlots = await scrapeCurrentPage(page, p);
       const newCount = addSlots(pageSlots);
-      log(`  Page ${p}: ${pageSlots.length} slots (${newCount} new, ${allSlots.length} unique total)`);
+      log(`── Page ${p}: ${pageSlots.length} slots (${newCount} new, ${allSlots.length} unique total) ──`);
+      for (const s of pageSlots) {
+        const { eligible } = isEligible(s);
+        const bo = isBlackedOut(s);
+        const tag = bo ? "BLACKOUT" : eligible ? "ELIGIBLE" : "skip";
+        log(`  [${tag}] ${s.dateText} | ${s.instructor}`);
+      }
       if (pageSlots.length === 0) break;
     } catch {
       log(`  Page ${p}: failed to load, stopping.`);
@@ -450,17 +459,11 @@ async function openBrowserAndScan(): Promise<void> {
 
     const allSlots = await scrapeAllSlots(page);
 
-    let slotsToBook: { slot: Slot; pickup: "Home" | "High School" }[];
+    const slotsToBook = allSlots
+      .map((slot) => ({ slot, ...isEligible(slot) }))
+      .filter((s) => s.eligible);
 
-    if (TEST_MODE) {
-      // In test mode: book the first available slot regardless of eligibility
-      log("⚠️ TEST MODE: will book the first available slot!");
-      slotsToBook = allSlots.length > 0 ? [{ slot: allSlots[0], pickup: "Home" }] : [];
-    } else {
-      slotsToBook = allSlots
-        .map((slot) => ({ slot, ...isEligible(slot) }))
-        .filter((s) => s.eligible);
-    }
+    const blackoutCount = allSlots.filter(s => isBlackedOut(s)).length;
 
     // Build scan summary
     const eligibleList = slotsToBook.length > 0
@@ -469,13 +472,10 @@ async function openBrowserAndScan(): Promise<void> {
         ).join("\n")
       : "  None";
 
-    const blackoutCount = allSlots.filter(s => isBlackedOut(s)).length;
-
     const scanMsg = [
       `📋 **Scan Complete** — ${new Date().toLocaleString("en-US")}`,
       `Total: ${allSlots.length} | Eligible: ${slotsToBook.length} | Blacked out: ${blackoutCount}`,
-      `${TEST_MODE ? "⚠️ **TEST MODE ON**\n" : ""}`,
-      `Eligible slots:\n${eligibleList}`,
+      `\nEligible slots:\n${eligibleList}`,
     ].join("\n");
 
     await notifyLog(scanMsg);
@@ -495,13 +495,9 @@ async function openBrowserAndScan(): Promise<void> {
           `📅 ${slot.dateText}\n` +
           `👤 Instructor: ${slot.instructor}\n` +
           `📍 Pickup: ${pickup}\n` +
-          `🕐 ${new Date().toLocaleString("en-US")}` +
-          `${TEST_MODE ? "\n⚠️ TEST MODE — cancel this booking!" : ""}`
+          `🕐 ${new Date().toLocaleString("en-US")}`
         );
       }
-
-      // In test mode, only book one slot
-      if (TEST_MODE) break;
     }
   } finally {
     await browser.close();
@@ -517,11 +513,9 @@ async function main(): Promise<void> {
   }).listen(port, () => log(`Health server listening on port ${port}`));
 
   log("Starting driving lesson booker...");
-  if (TEST_MODE) log("⚠️ TEST MODE ENABLED — will book first available slot!");
 
   await notifyAlert(
     `🟢 **Driving Booker Started**\nPolling every ${POLL_INTERVAL_MS / 60_000} minutes.` +
-    `${TEST_MODE ? "\n⚠️ **TEST MODE ON** — will book first available slot!" : ""}` +
     `\nBlackout dates: Feb 17-23, Apr 18-27` +
     `\nTime: ${new Date().toLocaleString("en-US")}`
   );
@@ -548,13 +542,6 @@ async function main(): Promise<void> {
       await notifyAlert(
         `🚨 **Scan Error**\n\nError: ${msg}\n\nStack:\n\`\`\`\n${stack.substring(0, 500)}\n\`\`\`\nTime: ${new Date().toLocaleString("en-US")}`
       );
-    }
-
-    // In test mode, stop after one scan
-    if (TEST_MODE) {
-      log("Test mode: stopping after one scan.");
-      await notifyAlert("🔵 **Test mode complete** — remove TEST_MODE env var to run normally.");
-      break;
     }
 
     const pollEnd = Date.now() + POLL_INTERVAL_MS;
