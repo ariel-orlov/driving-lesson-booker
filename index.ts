@@ -184,11 +184,14 @@ async function login(page: Page): Promise<void> {
 }
 
 async function navigateToSchedule(page: Page): Promise<void> {
-  // Navigate to schedule page
-  await page.goto("https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1", {
-    waitUntil: "networkidle2",
-    timeout: 30_000,
-  });
+  // Navigate to schedule page (retry once on frame-detached errors)
+  const url = "https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1";
+  try {
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 30_000 });
+  } catch {
+    await sleep(2000);
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 30_000 });
+  }
 
   await page.evaluate(() => {
     const links = document.querySelectorAll("a");
@@ -296,7 +299,8 @@ async function goToPage(page: Page, targetPage: number): Promise<boolean> {
   return true;
 }
 
-async function clickNextMonth(page: Page): Promise<boolean> {
+async function advanceDatepicker(page: Page): Promise<boolean> {
+  // ONLY advances the datepicker by one month. Does NOT click a date cell.
   const clicked = await page.evaluate(() => {
     // Try jQuery UI datepicker next button first (most reliable)
     const selectors = [
@@ -326,10 +330,13 @@ async function clickNextMonth(page: Page): Promise<boolean> {
   });
 
   if (!clicked) return false;
-  log(`Advanced calendar via ${clicked}`);
+  log(`Advanced datepicker via ${clicked}`);
   await sleep(2000);
+  return true;
+}
 
-  // Click the last available date in the datepicker (likely the newest month)
+async function clickDateInDatepicker(page: Page): Promise<boolean> {
+  // Clicks the last available date cell in the datepicker to trigger loading that month's slots.
   const dateClicked = await page.evaluate(() => {
     const cells = document.querySelectorAll(
       ".ui-datepicker td:not(.ui-state-disabled) a, .datepicker td:not(.disabled) a"
@@ -341,17 +348,20 @@ async function clickNextMonth(page: Page): Promise<boolean> {
     return false;
   });
 
-  if (dateClicked) {
-    await Promise.race([
-      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10_000 }).catch(() => {}),
-      sleep(5000),
-    ]);
-  } else {
+  if (!dateClicked) {
+    log("No available date cell found in datepicker.");
+    return false;
+  }
+
+  // Date click may trigger full navigation (frame can detach) — handle gracefully
+  try {
+    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10_000 });
+  } catch {
     await sleep(3000);
   }
 
   await page.waitForSelector("table tbody tr", { timeout: 15_000 }).catch(() => {
-    log("No slots table after advancing month.");
+    log("No slots table after clicking date in datepicker.");
   });
   await sleep(1000);
   return true;
@@ -421,15 +431,23 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   for (let m = 0; m < MAX_MONTHS_AHEAD; m++) {
     const calendarOffset = m + 1;
     await navigateToSchedule(page);
+
+    // Advance the datepicker calendarOffset times WITHOUT clicking any dates
     let advanced = true;
     for (let i = 0; i < calendarOffset; i++) {
-      if (!await clickNextMonth(page)) {
+      if (!await advanceDatepicker(page)) {
         advanced = false;
         break;
       }
     }
     if (!advanced) {
       log(`Calendar: no more months after +${m}.`);
+      break;
+    }
+
+    // NOW click a date to load the target month's slots
+    if (!await clickDateInDatepicker(page)) {
+      log(`Calendar +${calendarOffset}: could not click date in datepicker.`);
       break;
     }
 
@@ -485,12 +503,18 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
 
     // Advance to the correct month
     if (slot.monthOffset > 0) {
+      // Advance the datepicker N times without clicking dates
       for (let m = 0; m < slot.monthOffset; m++) {
-        const advanced = await clickNextMonth(page);
+        const advanced = await advanceDatepicker(page);
         if (!advanced) {
-          log(`Could not advance to month offset ${slot.monthOffset} for booking.`);
+          log(`Could not advance datepicker to month offset ${slot.monthOffset} for booking.`);
           return false;
         }
+      }
+      // Now click a date to load the target month's slots
+      if (!await clickDateInDatepicker(page)) {
+        log(`Could not click date in datepicker for month offset ${slot.monthOffset}.`);
+        return false;
       }
     }
 
@@ -630,29 +654,23 @@ async function openBrowserAndScan(): Promise<void> {
     const blackoutCount = allSlots.filter(s => isBlackedOut(s)).length;
     const skippedCount = allSlots.length - slotsToBook.length - blackoutCount;
 
-    // Detailed breakdown for each slot
-    const allSlotLines = allSlots.map(s => {
-      const { eligible, pickup } = isEligible(s);
-      const bo = isBlackedOut(s);
-      const tag = bo ? "🚫 BLACKOUT" : eligible ? `✅ ELIGIBLE (${pickup})` : "⏭️ skip";
-      return `${tag} — ${s.dateText} | ${s.instructor}`;
-    });
-
-    // Build full scan message for log channel
+    // Build concise scan summary for log channel
     const months = [...new Set(allSlots.map(s => parseSlotDate(s.dateText)?.month).filter(Boolean))].sort();
     const monthNames = months.map(m => Object.entries(MONTH_MAP).find(([, v]) => v === m)?.[0] ?? "?");
+
+    const eligibleSlotLines = slotsToBook
+      .map(({ slot, pickup }) => `• ${slot.dateText} | ${slot.instructor} | ${pickup}`)
+      .join("\n");
 
     const scanMsg = [
       `📋 **Scan Complete** — ${new Date().toLocaleString("en-US")}`,
       ``,
-      `**Months scanned:** ${monthNames.join(", ") || "none"}`,
-      `**Total slots:** ${allSlots.length}`,
-      `**Eligible:** ${slotsToBook.length}`,
-      `**Blacked out:** ${blackoutCount}`,
-      `**Skipped (wrong time):** ${skippedCount}`,
+      `**Months:** ${monthNames.join(", ") || "none"}`,
+      `**Total:** ${allSlots.length} | **Eligible:** ${slotsToBook.length} | **Blacked out:** ${blackoutCount} | **Skipped:** ${skippedCount}`,
       ``,
-      `**All slots:**`,
-      ...allSlotLines,
+      slotsToBook.length > 0
+        ? `**Eligible slots:**\n${eligibleSlotLines}`
+        : `No eligible slots found.`,
     ].join("\n");
 
     await notifyLog(scanMsg);
