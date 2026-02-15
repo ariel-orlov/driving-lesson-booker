@@ -11,13 +11,26 @@ const SCHEDULE_URL =
 const USERNAME = process.env.TDS_USERNAME!;
 const PASSWORD = process.env.TDS_PASSWORD!;
 
-const POLL_INTERVAL_MS = 3 * 60_000; // check every 3 minutes
+const POLL_INTERVAL_MS = 3 * 60_000;
 const MAX_PAGES = 20;
 
-// Regular updates (every scan cycle)
+// Set to true to book the first available slot regardless of eligibility (for testing)
+const TEST_MODE = process.env.TEST_MODE === "true";
+
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
-// Important alerts (bookings + errors only)
 const DISCORD_ALERT = process.env.DISCORD_WEBHOOK_IMPORTANT!;
+
+// ── Blackout dates (don't book during these ranges) ─────────────────────────
+// Format: [month, startDay, endDay] (month is 1-indexed)
+const BLACKOUT_RANGES: [number, number, number][] = [
+  [2, 17, 23],  // Feb 17-23
+  [4, 18, 27],  // Apr 18-27
+];
+
+const MONTH_MAP: Record<string, number> = {
+  Jan: 1, Feb: 2, Mar: 3, Apr: 4, May: 5, Jun: 6,
+  Jul: 7, Aug: 8, Sep: 9, Oct: 10, Nov: 11, Dec: 12,
+};
 
 // ── Types ───────────────────────────────────────────────────────────────────
 interface Slot {
@@ -29,21 +42,35 @@ interface Slot {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-function parseSlotTime(dateText: string): { dayOfWeek: string; hour: number; minute: number } | null {
+function parseSlotDate(dateText: string): { dayOfWeek: string; month: number; day: number; hour: number; minute: number } | null {
   const match = dateText.match(
-    /^(\w+),\s+\w+\s+\d+,\s+(\d{1,2}):(\d{2})\s+(AM|PM)/
+    /^(\w+),\s+(\w+)\s+(\d+),\s+(\d{1,2}):(\d{2})\s+(AM|PM)/
   );
   if (!match) return null;
 
   const dayOfWeek = match[1];
-  let hour = parseInt(match[2], 10);
-  const minute = parseInt(match[3], 10);
-  const ampm = match[4];
+  const month = MONTH_MAP[match[2]] ?? 0;
+  const day = parseInt(match[3], 10);
+  let hour = parseInt(match[4], 10);
+  const minute = parseInt(match[5], 10);
+  const ampm = match[6];
 
   if (ampm === "PM" && hour !== 12) hour += 12;
   if (ampm === "AM" && hour === 12) hour = 0;
 
-  return { dayOfWeek, hour, minute };
+  return { dayOfWeek, month, day, hour, minute };
+}
+
+function isBlackedOut(slot: Slot): boolean {
+  const parsed = parseSlotDate(slot.dateText);
+  if (!parsed) return false;
+
+  for (const [month, startDay, endDay] of BLACKOUT_RANGES) {
+    if (parsed.month === month && parsed.day >= startDay && parsed.day <= endDay) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isWeekend(dayOfWeek: string): boolean {
@@ -51,7 +78,9 @@ function isWeekend(dayOfWeek: string): boolean {
 }
 
 function isEligible(slot: Slot): { eligible: boolean; pickup: "Home" | "High School" } {
-  const parsed = parseSlotTime(slot.dateText);
+  if (isBlackedOut(slot)) return { eligible: false, pickup: "Home" };
+
+  const parsed = parseSlotDate(slot.dateText);
   if (!parsed) return { eligible: false, pickup: "Home" };
 
   const { dayOfWeek, hour, minute } = parsed;
@@ -94,9 +123,7 @@ async function sendDiscord(webhookUrl: string, message: string): Promise<void> {
     return;
   }
   try {
-    // Write JSON to a temp file to avoid shell escaping issues
     const tmpFile = `/tmp/discord_${Date.now()}.json`;
-    // Discord max message length is 2000 chars
     const truncated = message.length > 1900 ? message.substring(0, 1900) + "\n..." : message;
     fs.writeFileSync(tmpFile, JSON.stringify({ content: truncated }));
     const resp = await fetch(webhookUrl, {
@@ -147,8 +174,6 @@ async function login(page: Page): Promise<void> {
 
 async function navigateToSchedule(page: Page): Promise<void> {
   log("Navigating to Schedule My Drive...");
-  // Must visit My Schedule first, then click Schedule My Drive tab
-  // (sets server-side session state needed for pagination to work)
   await page.goto("https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1", {
     waitUntil: "networkidle2",
     timeout: 30_000,
@@ -208,12 +233,10 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     return newCount;
   }
 
-  // Page 1 is already loaded
   const page1Slots = await scrapeCurrentPage(page, 1);
   addSlots(page1Slots);
   log(`  Page 1: ${page1Slots.length} slots`);
 
-  // Navigate directly to each subsequent page
   for (let p = 2; p <= MAX_PAGES; p++) {
     try {
       await page.goto(`${SCHEDULE_URL}&page=${p}`, { waitUntil: "networkidle2", timeout: 15_000 });
@@ -231,7 +254,6 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   return allSlots;
 }
 
-// Returns ms until the next XX:00:05 or XX:30:05
 function msUntilNextHourEdge(): number {
   const now = new Date();
   const min = now.getMinutes();
@@ -240,8 +262,8 @@ function msUntilNextHourEdge(): number {
 
   const currentMs = (min * 60 + sec) * 1000 + ms;
 
-  const target1 = (0 * 60 + 5) * 1000;   // 00:05.000
-  const target2 = (30 * 60 + 5) * 1000;  // 30:05.000
+  const target1 = (0 * 60 + 5) * 1000;
+  const target2 = (30 * 60 + 5) * 1000;
   const hourMs = 60 * 60 * 1000;
 
   const candidates = [
@@ -263,60 +285,147 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
     await page.goto(url, { waitUntil: "networkidle2", timeout: 15_000 });
     await sleep(2000);
 
-    // Find and click the slot link
-    const slotLinks = await page.$$("table tbody tr td:first-child a");
-    let clicked = false;
-
-    for (const link of slotLinks) {
-      const text = await link.evaluate((el) => el.textContent?.trim() ?? "");
-      if (text === slot.dateText) {
-        await link.click();
-        clicked = true;
-        break;
-      }
-    }
-
-    if (!clicked) {
-      log(`Could not find slot link for: ${slot.dateText}`);
-      return false;
-    }
-
-    await sleep(1500);
-
-    // Select pickup location
-    await page.evaluate((pickupType) => {
-      const radios = document.querySelectorAll('input[type="radio"]');
-      for (const radio of radios) {
-        const label = radio.closest("li")?.textContent?.trim();
-        if (label && label.includes(pickupType)) {
-          (radio as HTMLInputElement).click();
-          break;
-        }
-      }
-    }, pickup);
-
-    await sleep(500);
-
-    // Click "Schedule Lesson"
-    const scheduled = await page.evaluate(() => {
-      const buttons = document.querySelectorAll("button");
-      for (const btn of buttons) {
-        if (btn.textContent?.trim() === "Schedule Lesson") {
-          btn.click();
+    // Find and click the slot link in the table
+    const slotClicked = await page.evaluate((targetDate) => {
+      const rows = document.querySelectorAll("table tbody tr");
+      for (const row of rows) {
+        const firstCell = row.querySelector("td:first-child a");
+        if (firstCell && firstCell.textContent?.trim() === targetDate) {
+          (firstCell as HTMLElement).click();
           return true;
         }
       }
       return false;
-    });
+    }, slot.dateText);
 
-    if (!scheduled) {
-      log("Schedule Lesson button not found.");
+    if (!slotClicked) {
+      log(`Could not find slot link for: ${slot.dateText}`);
       return false;
     }
+
+    log("Clicked slot link, waiting for booking dialog...");
     await sleep(3000);
 
-    log(`BOOKED: ${slot.dateText} with ${slot.instructor} (pickup: ${pickup})`);
-    return true;
+    // Debug: log what's visible in the dialog
+    const dialogInfo = await page.evaluate(() => {
+      const radios = document.querySelectorAll('input[type="radio"]');
+      const radioInfo: string[] = [];
+      radios.forEach((r) => {
+        const input = r as HTMLInputElement;
+        const label = r.closest("label")?.textContent?.trim()
+          || r.closest("li")?.textContent?.trim()
+          || r.closest("div")?.textContent?.trim()?.substring(0, 50)
+          || "no label";
+        radioInfo.push(`name=${input.name} value=${input.value} checked=${input.checked} label="${label}"`);
+      });
+
+      const selects = document.querySelectorAll("select");
+      const selectInfo: string[] = [];
+      selects.forEach((s) => {
+        const opts = Array.from(s.options).map(o => `${o.value}="${o.text}"`);
+        selectInfo.push(`select#${s.id}: ${opts.join(", ")}`);
+      });
+
+      const buttons = document.querySelectorAll("button, input[type='submit']");
+      const buttonInfo: string[] = [];
+      buttons.forEach((b) => {
+        const text = b.textContent?.trim() || (b as HTMLInputElement).value || "";
+        if (text) buttonInfo.push(text);
+      });
+
+      // Check for modal/dialog
+      const modals = document.querySelectorAll(".modal, [class*='dialog'], [class*='popup'], [role='dialog']");
+
+      return {
+        radios: radioInfo,
+        selects: selectInfo,
+        buttons: buttonInfo,
+        modalCount: modals.length,
+        bodyText: document.body.innerText.substring(document.body.innerText.length - 2000),
+      };
+    });
+
+    log(`Dialog debug - radios: ${JSON.stringify(dialogInfo.radios)}`);
+    log(`Dialog debug - selects: ${JSON.stringify(dialogInfo.selects)}`);
+    log(`Dialog debug - buttons: ${JSON.stringify(dialogInfo.buttons)}`);
+    log(`Dialog debug - modals: ${dialogInfo.modalCount}`);
+
+    // Select the pickup location radio button
+    const radioSelected = await page.evaluate((pickupType) => {
+      const radios = document.querySelectorAll('input[type="radio"]');
+      for (const radio of radios) {
+        const input = radio as HTMLInputElement;
+        // Check label text from various parent containers
+        const labelText = (
+          radio.closest("label")?.textContent?.trim() ||
+          radio.closest("li")?.textContent?.trim() ||
+          radio.closest("div")?.textContent?.trim() ||
+          ""
+        );
+        if (labelText.includes(pickupType)) {
+          input.checked = true;
+          input.click();
+          input.dispatchEvent(new Event("change", { bubbles: true }));
+          return `Selected: "${labelText}"`;
+        }
+      }
+      // Fallback: just click the first radio button
+      if (radios.length > 0) {
+        const first = radios[0] as HTMLInputElement;
+        first.checked = true;
+        first.click();
+        first.dispatchEvent(new Event("change", { bubbles: true }));
+        return `Fallback: clicked first radio`;
+      }
+      return null;
+    }, pickup);
+
+    log(`Radio selection: ${radioSelected}`);
+    await sleep(1000);
+
+    // Click "Schedule Lesson" button - try multiple selectors
+    const bookClicked = await page.evaluate(() => {
+      // Try exact text match
+      const buttons = document.querySelectorAll("button, input[type='submit'], input[type='button'], a.btn");
+      for (const btn of buttons) {
+        const text = btn.textContent?.trim() || (btn as HTMLInputElement).value || "";
+        if (text.includes("Schedule") || text.includes("Book") || text.includes("Confirm") || text.includes("Submit")) {
+          (btn as HTMLElement).click();
+          return `Clicked: "${text}"`;
+        }
+      }
+      return null;
+    });
+
+    if (!bookClicked) {
+      log("Could not find booking button!");
+      return false;
+    }
+
+    log(`Book button: ${bookClicked}`);
+    await sleep(4000);
+
+    // Check if booking was successful by looking for confirmation or error
+    const result = await page.evaluate(() => {
+      const bodyText = document.body.innerText;
+      if (bodyText.includes("successfully") || bodyText.includes("scheduled") || bodyText.includes("confirmed")) {
+        return "success";
+      }
+      if (bodyText.includes("error") || bodyText.includes("failed") || bodyText.includes("unavailable")) {
+        return "error: " + bodyText.substring(0, 200);
+      }
+      return "unknown";
+    });
+
+    log(`Booking result: ${result}`);
+
+    if (result === "success" || result === "unknown") {
+      log(`BOOKED: ${slot.dateText} with ${slot.instructor} (pickup: ${pickup})`);
+      return true;
+    }
+
+    log(`Booking may have failed: ${result}`);
+    return false;
   } catch (err) {
     log(`Failed to book slot: ${err}`);
     const msg = err instanceof Error ? err.message : String(err);
@@ -341,33 +450,43 @@ async function openBrowserAndScan(): Promise<void> {
 
     const allSlots = await scrapeAllSlots(page);
 
-    const eligibleSlots = allSlots
-      .map((slot) => ({ slot, ...isEligible(slot) }))
-      .filter((s) => s.eligible);
+    let slotsToBook: { slot: Slot; pickup: "Home" | "High School" }[];
 
-    // Build scan summary for the log channel
-    const eligibleList = eligibleSlots.length > 0
-      ? eligibleSlots.map(({ slot, pickup }) =>
+    if (TEST_MODE) {
+      // In test mode: book the first available slot regardless of eligibility
+      log("⚠️ TEST MODE: will book the first available slot!");
+      slotsToBook = allSlots.length > 0 ? [{ slot: allSlots[0], pickup: "Home" }] : [];
+    } else {
+      slotsToBook = allSlots
+        .map((slot) => ({ slot, ...isEligible(slot) }))
+        .filter((s) => s.eligible);
+    }
+
+    // Build scan summary
+    const eligibleList = slotsToBook.length > 0
+      ? slotsToBook.map(({ slot, pickup }) =>
           `  • ${slot.dateText} | ${slot.instructor} | ${pickup}`
         ).join("\n")
       : "  None";
 
+    const blackoutCount = allSlots.filter(s => isBlackedOut(s)).length;
+
     const scanMsg = [
       `📋 **Scan Complete** — ${new Date().toLocaleString("en-US")}`,
-      `Total slots: ${allSlots.length} | Eligible: ${eligibleSlots.length}`,
-      `\nEligible slots:\n${eligibleList}`,
+      `Total: ${allSlots.length} | Eligible: ${slotsToBook.length} | Blacked out: ${blackoutCount}`,
+      `${TEST_MODE ? "⚠️ **TEST MODE ON**\n" : ""}`,
+      `Eligible slots:\n${eligibleList}`,
     ].join("\n");
 
     await notifyLog(scanMsg);
-    log(`Found ${allSlots.length} total, ${eligibleSlots.length} eligible.`);
+    log(`Found ${allSlots.length} total, ${slotsToBook.length} eligible, ${blackoutCount} blacked out.`);
 
-    if (eligibleSlots.length === 0) {
+    if (slotsToBook.length === 0) {
       log("No eligible slots right now. Will keep checking...");
       return;
     }
 
-    // Book all eligible slots
-    for (const { slot, pickup } of eligibleSlots) {
+    for (const { slot, pickup } of slotsToBook) {
       const success = await bookSlot(page, slot, pickup);
       if (success) {
         log("Lesson booked successfully!");
@@ -376,9 +495,13 @@ async function openBrowserAndScan(): Promise<void> {
           `📅 ${slot.dateText}\n` +
           `👤 Instructor: ${slot.instructor}\n` +
           `📍 Pickup: ${pickup}\n` +
-          `🕐 ${new Date().toLocaleString("en-US")}`
+          `🕐 ${new Date().toLocaleString("en-US")}` +
+          `${TEST_MODE ? "\n⚠️ TEST MODE — cancel this booking!" : ""}`
         );
       }
+
+      // In test mode, only book one slot
+      if (TEST_MODE) break;
     }
   } finally {
     await browser.close();
@@ -387,7 +510,6 @@ async function openBrowserAndScan(): Promise<void> {
 }
 
 async function main(): Promise<void> {
-  // Health check server so Railway doesn't kill the container
   const port = process.env.PORT || 3000;
   http.createServer((_req, res) => {
     res.writeHead(200);
@@ -395,10 +517,13 @@ async function main(): Promise<void> {
   }).listen(port, () => log(`Health server listening on port ${port}`));
 
   log("Starting driving lesson booker...");
+  if (TEST_MODE) log("⚠️ TEST MODE ENABLED — will book first available slot!");
 
-  // Startup notification
   await notifyAlert(
-    `🟢 **Driving Booker Started**\nPolling every ${POLL_INTERVAL_MS / 60_000} minutes.\nTime: ${new Date().toLocaleString("en-US")}`
+    `🟢 **Driving Booker Started**\nPolling every ${POLL_INTERVAL_MS / 60_000} minutes.` +
+    `${TEST_MODE ? "\n⚠️ **TEST MODE ON** — will book first available slot!" : ""}` +
+    `\nBlackout dates: Feb 17-23, Apr 18-27` +
+    `\nTime: ${new Date().toLocaleString("en-US")}`
   );
 
   let hourEdgePending = false;
@@ -423,6 +548,13 @@ async function main(): Promise<void> {
       await notifyAlert(
         `🚨 **Scan Error**\n\nError: ${msg}\n\nStack:\n\`\`\`\n${stack.substring(0, 500)}\n\`\`\`\nTime: ${new Date().toLocaleString("en-US")}`
       );
+    }
+
+    // In test mode, stop after one scan
+    if (TEST_MODE) {
+      log("Test mode: stopping after one scan.");
+      await notifyAlert("🔵 **Test mode complete** — remove TEST_MODE env var to run normally.");
+      break;
     }
 
     const pollEnd = Date.now() + POLL_INTERVAL_MS;
