@@ -1,5 +1,6 @@
 import puppeteer, { type Page } from "puppeteer";
 import http from "http";
+import fs from "fs";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const LOGIN_URL =
@@ -11,13 +12,16 @@ const USERNAME = process.env.TDS_USERNAME!;
 const PASSWORD = process.env.TDS_PASSWORD!;
 
 const POLL_INTERVAL_MS = 3 * 60_000; // check every 3 minutes
-const MAX_PAGES = 20; // scan all pagination pages
+const MAX_PAGES = 20;
 
-const DISCORD_WEBHOOK = process.env.DISCORD_WEBHOOK!;
+// Regular updates (every scan cycle)
+const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
+// Important alerts (bookings + errors only)
+const DISCORD_ALERT = process.env.DISCORD_WEBHOOK_IMPORTANT!;
 
 // ── Types ───────────────────────────────────────────────────────────────────
 interface Slot {
-  dateText: string; // e.g. "Mon, Mar 16, 3:00 PM - 4:30 PM"
+  dateText: string;
   instructor: string;
   rowIndex: number;
   page: number;
@@ -26,7 +30,6 @@ interface Slot {
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 function parseSlotTime(dateText: string): { dayOfWeek: string; hour: number; minute: number } | null {
-  // Format: "Mon, Mar 16, 3:00 PM - 4:30 PM"
   const match = dateText.match(
     /^(\w+),\s+\w+\s+\d+,\s+(\d{1,2}):(\d{2})\s+(AM|PM)/
   );
@@ -55,7 +58,6 @@ function isEligible(slot: Slot): { eligible: boolean; pickup: "Home" | "High Sch
   const timeInMinutes = hour * 60 + minute;
 
   if (isWeekend(dayOfWeek)) {
-    // Weekends: any time, pickup = Home
     return { eligible: true, pickup: "Home" };
   }
 
@@ -80,41 +82,43 @@ function log(msg: string): void {
   console.log(`[${timestamp()}] ${msg}`);
 }
 
-// ── Notifications ──────────────────────────────────────────────────────────
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
-async function notify(title: string, body: string): Promise<void> {
-  if (!DISCORD_WEBHOOK) {
-    log(`NO DISCORD WEBHOOK — would have sent: "${title}"`);
+// ── Discord notifications ──────────────────────────────────────────────────
+
+async function sendDiscord(webhookUrl: string, message: string): Promise<void> {
+  if (!webhookUrl) {
+    log("Discord webhook not configured");
     return;
   }
   try {
-    const fs = await import("fs");
+    // Write JSON to a temp file to avoid shell escaping issues
     const tmpFile = `/tmp/discord_${Date.now()}.json`;
-    fs.writeFileSync(tmpFile, JSON.stringify({ content: `**${title}**\n${body}` }));
-    const resp = await fetch(DISCORD_WEBHOOK, {
+    // Discord max message length is 2000 chars
+    const truncated = message.length > 1900 ? message.substring(0, 1900) + "\n..." : message;
+    fs.writeFileSync(tmpFile, JSON.stringify({ content: truncated }));
+    const resp = await fetch(webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: fs.readFileSync(tmpFile, "utf-8"),
     });
     fs.unlinkSync(tmpFile);
-    if (resp.ok || resp.status === 204) {
-      log(`Discord notification sent: "${title}"`);
-    } else {
-      log(`Discord notification failed: ${resp.status}`);
+    if (!resp.ok && resp.status !== 204) {
+      log(`Discord send failed: ${resp.status}`);
     }
   } catch (err) {
-    log(`Discord notification error: ${err}`);
+    log(`Discord send error: ${err}`);
   }
 }
 
-async function sendErrorAlert(error: unknown, context: string): Promise<void> {
-  const msg = error instanceof Error ? error.message : String(error);
-  const stack = error instanceof Error ? error.stack ?? "" : "";
+async function notifyLog(message: string): Promise<void> {
+  await sendDiscord(DISCORD_LOG, message);
+}
 
-  await notify(
-    `Driving Booker Error: ${context}`,
-    `Error: ${msg}\n\nContext: ${context}\nStack:\n${stack}\nTime: ${new Date().toISOString()}`
-  );
+async function notifyAlert(message: string): Promise<void> {
+  await sendDiscord(DISCORD_ALERT, message);
 }
 
 // ── Browser actions ─────────────────────────────────────────────────────────
@@ -123,16 +127,13 @@ async function login(page: Page): Promise<void> {
   log("Navigating to login page...");
   await page.goto(LOGIN_URL, { waitUntil: "domcontentloaded", timeout: 30_000 });
 
-  // Wait for login form to be ready
   await page.waitForSelector("#username", { visible: true, timeout: 15_000 });
 
-  // Clear fields first (in case of re-login) then fill
   await page.$eval("#username", (el) => ((el as HTMLInputElement).value = ""));
   await page.$eval("#password", (el) => ((el as HTMLInputElement).value = ""));
   await page.type("#username", USERNAME);
   await page.type("#password", PASSWORD);
 
-  // Click login button and wait for navigation
   await Promise.all([
     page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30_000 }),
     page.evaluate(() => {
@@ -146,14 +147,13 @@ async function login(page: Page): Promise<void> {
 
 async function navigateToSchedule(page: Page): Promise<void> {
   log("Navigating to Schedule My Drive...");
-  // Go to My Schedule first, then click the Schedule My Drive tab
-  // (the tab click sets server-side session state needed for pagination)
+  // Must visit My Schedule first, then click Schedule My Drive tab
+  // (sets server-side session state needed for pagination to work)
   await page.goto("https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1", {
     waitUntil: "networkidle2",
     timeout: 30_000,
   });
 
-  // Click the "Schedule My Drive" tab
   await page.evaluate(() => {
     const links = document.querySelectorAll("a");
     for (const link of links) {
@@ -164,12 +164,10 @@ async function navigateToSchedule(page: Page): Promise<void> {
     }
   });
 
-  // Wait for the slots table to appear
   await page.waitForSelector("table tbody tr", { timeout: 15_000 }).catch(() => {
     log("No slots table found (may be empty).");
   });
 
-  // Small delay for dynamic content
   await sleep(2000);
 }
 
@@ -183,7 +181,6 @@ async function scrapeCurrentPage(page: Page, pageNum: number): Promise<Slot[]> {
       if (cells.length >= 2) {
         const dateText = cells[0]?.textContent?.trim() ?? "";
         const instructor = cells[1]?.textContent?.trim() ?? "";
-        // Only include real slots (format: "Day, Mon DD, H:MM AM/PM - H:MM AM/PM")
         if (dateText && /^\w{3},\s+\w{3}\s+\d/.test(dateText)) {
           slots.push({ dateText, instructor, rowIndex: idx, page: pn });
         }
@@ -216,7 +213,7 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   addSlots(page1Slots);
   log(`  Page 1: ${page1Slots.length} slots`);
 
-  // Navigate directly to each subsequent page via URL
+  // Navigate directly to each subsequent page
   for (let p = 2; p <= MAX_PAGES; p++) {
     try {
       await page.goto(`${SCHEDULE_URL}&page=${p}`, { waitUntil: "networkidle2", timeout: 15_000 });
@@ -243,7 +240,6 @@ function msUntilNextHourEdge(): number {
 
   const currentMs = (min * 60 + sec) * 1000 + ms;
 
-  // Targets: 00:05 (5s into hour) and 30:05 (30m 5s into hour)
   const target1 = (0 * 60 + 5) * 1000;   // 00:05.000
   const target2 = (30 * 60 + 5) * 1000;  // 30:05.000
   const hourMs = 60 * 60 * 1000;
@@ -251,7 +247,7 @@ function msUntilNextHourEdge(): number {
   const candidates = [
     target1 - currentMs,
     target2 - currentMs,
-    target1 + hourMs - currentMs, // next hour's :00:05
+    target1 + hourMs - currentMs,
   ];
 
   const positive = candidates.filter((c) => c > 0);
@@ -285,7 +281,6 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
       return false;
     }
 
-    // Wait for dialog to appear
     await sleep(1500);
 
     // Select pickup location
@@ -324,18 +319,15 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
     return true;
   } catch (err) {
     log(`Failed to book slot: ${err}`);
-    await sendErrorAlert(err, `booking slot: ${slot.dateText}`);
+    const msg = err instanceof Error ? err.message : String(err);
+    await notifyAlert(`🚨 **Booking Error**\nSlot: ${slot.dateText}\nInstructor: ${slot.instructor}\nError: ${msg}`);
     return false;
   }
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 // ── Main loop ───────────────────────────────────────────────────────────────
 
-async function openBrowserAndScan(): Promise<boolean> {
+async function openBrowserAndScan(): Promise<void> {
   const browser = await puppeteer.launch({
     headless: true,
     defaultViewport: { width: 1280, height: 900 },
@@ -348,42 +340,46 @@ async function openBrowserAndScan(): Promise<boolean> {
     await navigateToSchedule(page);
 
     const allSlots = await scrapeAllSlots(page);
-    log(`Found ${allSlots.length} unique slots across all pages.`);
-
-    if (allSlots.length > 0) {
-      log("All available slots:");
-      for (const slot of allSlots) {
-        const { eligible, pickup } = isEligible(slot);
-        const tag = eligible ? `ELIGIBLE (${pickup})` : "skip (wrong time)";
-        log(`  [${tag}] ${slot.dateText} | ${slot.instructor}`);
-      }
-    }
 
     const eligibleSlots = allSlots
       .map((slot) => ({ slot, ...isEligible(slot) }))
       .filter((s) => s.eligible);
 
+    // Build scan summary for the log channel
+    const eligibleList = eligibleSlots.length > 0
+      ? eligibleSlots.map(({ slot, pickup }) =>
+          `  • ${slot.dateText} | ${slot.instructor} | ${pickup}`
+        ).join("\n")
+      : "  None";
+
+    const scanMsg = [
+      `📋 **Scan Complete** — ${new Date().toLocaleString("en-US")}`,
+      `Total slots: ${allSlots.length} | Eligible: ${eligibleSlots.length}`,
+      `\nEligible slots:\n${eligibleList}`,
+    ].join("\n");
+
+    await notifyLog(scanMsg);
+    log(`Found ${allSlots.length} total, ${eligibleSlots.length} eligible.`);
+
     if (eligibleSlots.length === 0) {
       log("No eligible slots right now. Will keep checking...");
-      return false;
+      return;
     }
 
-    log(`Found ${eligibleSlots.length} eligible slot(s):`);
-    for (const { slot, pickup } of eligibleSlots) {
-      log(`  - ${slot.dateText} | ${slot.instructor} | pickup: ${pickup}`);
-    }
-
+    // Book all eligible slots
     for (const { slot, pickup } of eligibleSlots) {
       const success = await bookSlot(page, slot, pickup);
       if (success) {
         log("Lesson booked successfully!");
-        await notify(
-          "Driving Lesson Booked!",
-          `Successfully booked:\n\n${slot.dateText}\nInstructor: ${slot.instructor}\nPickup: ${pickup}\n\nTime: ${new Date().toISOString()}`
+        await notifyAlert(
+          `✅ **Driving Lesson Booked!**\n\n` +
+          `📅 ${slot.dateText}\n` +
+          `👤 Instructor: ${slot.instructor}\n` +
+          `📍 Pickup: ${pickup}\n` +
+          `🕐 ${new Date().toLocaleString("en-US")}`
         );
       }
     }
-    return false; // keep polling for more slots
   } finally {
     await browser.close();
     log("Browser closed.");
@@ -400,13 +396,10 @@ async function main(): Promise<void> {
 
   log("Starting driving lesson booker...");
 
-  // Verify notifications work on startup
-  await notify(
-    "Driving Booker Started",
-    `The driving lesson booker is now running.\n\nTime: ${new Date().toISOString()}`
+  // Startup notification
+  await notifyAlert(
+    `🟢 **Driving Booker Started**\nPolling every ${POLL_INTERVAL_MS / 60_000} minutes.\nTime: ${new Date().toLocaleString("en-US")}`
   );
-
-  let booked = false;
 
   let hourEdgePending = false;
   function scheduleHourEdgeCheck() {
@@ -420,13 +413,16 @@ async function main(): Promise<void> {
 
   scheduleHourEdgeCheck();
 
-  while (!booked) {
+  while (true) {
     try {
-      booked = await openBrowserAndScan();
-      if (booked) break;
+      await openBrowserAndScan();
     } catch (err) {
-      log(`Error during scan: ${err}`);
-      await sendErrorAlert(err, "scan/book cycle");
+      const msg = err instanceof Error ? err.message : String(err);
+      const stack = err instanceof Error ? err.stack ?? "" : "";
+      log(`Error during scan: ${msg}`);
+      await notifyAlert(
+        `🚨 **Scan Error**\n\nError: ${msg}\n\nStack:\n\`\`\`\n${stack.substring(0, 500)}\n\`\`\`\nTime: ${new Date().toLocaleString("en-US")}`
+      );
     }
 
     const pollEnd = Date.now() + POLL_INTERVAL_MS;
@@ -446,6 +442,7 @@ async function main(): Promise<void> {
 
 main().catch(async (err) => {
   console.error("Fatal error:", err);
-  await sendErrorAlert(err, "fatal crash");
+  const msg = err instanceof Error ? err.message : String(err);
+  await notifyAlert(`💀 **Fatal Crash**\n\n${msg}\n\nTime: ${new Date().toLocaleString("en-US")}`);
   process.exit(1);
 });
