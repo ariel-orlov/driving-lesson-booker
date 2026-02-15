@@ -10,7 +10,7 @@ const PASSWORD = process.env.TDS_PASSWORD!;
 
 const POLL_INTERVAL_MS = 3 * 60_000;
 const MAX_PAGES = 10; // safety cap; actual page count detected dynamically
-const MAX_MONTHS_AHEAD = 4;
+const MAX_MONTHS_AHEAD = 8; // keep expanding as new months appear; loop breaks when no new slots found
 
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
 const DISCORD_ALERT = process.env.DISCORD_WEBHOOK_IMPORTANT!;
@@ -112,6 +112,20 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Wait until the page's main frame is usable (recovers after frame detach). */
+async function ensurePageReady(page: Page): Promise<void> {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    try {
+      await page.evaluate(() => document.readyState);
+      return;
+    } catch {
+      log(`Frame not ready (attempt ${attempt + 1}/10), waiting...`);
+      await sleep(2000);
+    }
+  }
+  throw new Error("Page frame could not recover after 10 attempts");
+}
+
 // ── Discord notifications ──────────────────────────────────────────────────
 
 async function sendDiscord(webhookUrl: string, message: string): Promise<void> {
@@ -189,12 +203,15 @@ async function login(page: Page): Promise<void> {
 }
 
 async function navigateToSchedule(page: Page): Promise<void> {
-  // Navigate to schedule page (retry once on frame-detached errors)
+  // Ensure frame is usable (may be detached after datepicker navigation)
+  await ensurePageReady(page);
+
   const url = "https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1";
   try {
     await page.goto(url, { waitUntil: "networkidle2", timeout: 30_000 });
   } catch {
-    await sleep(2000);
+    await sleep(3000);
+    await ensurePageReady(page);
     await page.goto(url, { waitUntil: "networkidle2", timeout: 30_000 });
   }
 
@@ -255,51 +272,86 @@ async function getMaxPage(page: Page): Promise<number> {
 }
 
 async function goToPage(page: Page, targetPage: number): Promise<boolean> {
-  // Strategy 1: DataTables API — directly switch page without any click events
+  // Strategy 1: DataTables API — switch page without click events
   const dtResult = await page.evaluate((target) => {
     try {
       const jq = (window as any).jQuery;
-      if (!jq) return null;
-      const dt = jq("table").DataTable();
-      dt.page(target - 1).draw(false);
-      return "datatables";
+      if (!jq || !jq.fn?.dataTable) return null;
+      // Try multiple selectors for the DataTable
+      for (const sel of ["table.dataTable", "#DataTables_Table_0", "table"]) {
+        try {
+          const dt = jq(sel).DataTable();
+          const info = dt.page.info();
+          if (info && info.pages > 1) {
+            dt.page(target - 1).draw(false);
+            return `datatables(${sel})`;
+          }
+        } catch { /* try next selector */ }
+      }
+      return null;
     } catch {
       return null;
     }
   }, targetPage);
 
   if (dtResult) {
-    log(`Switched to page ${targetPage} via DataTables API`);
+    log(`Switched to page ${targetPage} via ${dtResult}`);
     await sleep(500);
     return true;
   }
 
-  // Strategy 2: jQuery .trigger('click') on pagination link
-  const result = await page.evaluate((target) => {
+  // Strategy 2: Navigate via window.location.href (preserves session state unlike page.goto)
+  const pageUrl = await page.evaluate((target) => {
     const links = document.querySelectorAll("a");
     for (const link of links) {
       const text = link.textContent?.trim();
-      const href = link.href || "";
-      if (text === String(target) && href.includes("page=")) {
-        if (typeof (window as any).jQuery !== "undefined") {
-          (window as any).jQuery(link).trigger("click");
-          return "jquery";
-        }
-        link.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
-        return "mouseevent";
+      const href = link.getAttribute("href") || "";
+      if (text === String(target) && (href.includes("page=") || link.href.includes("page="))) {
+        return link.href; // full resolved URL
       }
     }
     return null;
   }, targetPage);
 
-  if (!result) {
+  if (pageUrl) {
+    log(`Navigating to page ${targetPage} via window.location.href`);
+    try {
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15_000 }),
+        page.evaluate((url) => { window.location.href = url; }, pageUrl),
+      ]);
+    } catch {
+      await sleep(3000);
+      await ensurePageReady(page);
+    }
+    await sleep(500);
+    return true;
+  }
+
+  // Strategy 3: jQuery trigger + fallback click
+  const clickResult = await page.evaluate((target) => {
+    const links = document.querySelectorAll("a");
+    for (const link of links) {
+      const text = link.textContent?.trim();
+      if (text === String(target)) {
+        const jq = (window as any).jQuery;
+        if (jq) {
+          jq(link).trigger("click");
+          return "jquery-trigger";
+        }
+        link.click();
+        return "dom-click";
+      }
+    }
+    return null;
+  }, targetPage);
+
+  if (!clickResult) {
     log(`No page link found for page ${targetPage}`);
     return false;
   }
 
-  log(`Clicked page ${targetPage} via ${result}`);
-
-  // Wait for content update
+  log(`Clicked page ${targetPage} via ${clickResult}`);
   await Promise.race([
     page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10_000 }).catch(() => {}),
     sleep(3000),
@@ -345,33 +397,50 @@ async function advanceDatepicker(page: Page): Promise<boolean> {
 }
 
 async function clickDateInDatepicker(page: Page): Promise<boolean> {
-  // Clicks the last available date cell in the datepicker to trigger loading that month's slots.
-  const dateClicked = await page.evaluate(() => {
+  // Check if a date cell exists before clicking
+  const hasDate = await page.evaluate(() => {
     const cells = document.querySelectorAll(
       ".ui-datepicker td:not(.ui-state-disabled) a, .datepicker td:not(.disabled) a"
     );
-    if (cells.length > 0) {
-      (cells[cells.length - 1] as HTMLElement).click();
-      return true;
-    }
-    return false;
+    return cells.length > 0;
   });
 
-  if (!dateClicked) {
+  if (!hasDate) {
     log("No available date cell found in datepicker.");
     return false;
   }
 
-  // Date click may trigger full navigation (frame can detach) — handle gracefully
+  // Use Promise.all to properly track the navigation triggered by the date click.
+  // This prevents "detached frame" errors by ensuring waitForNavigation is set up
+  // BEFORE the click fires.
   try {
-    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10_000 });
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15_000 }),
+      page.evaluate(() => {
+        const cells = document.querySelectorAll(
+          ".ui-datepicker td:not(.ui-state-disabled) a, .datepicker td:not(.disabled) a"
+        );
+        if (cells.length > 0) {
+          (cells[cells.length - 1] as HTMLElement).click();
+        }
+      }),
+    ]);
   } catch {
+    // Navigation may have detached the frame — wait for recovery
     await sleep(3000);
+    try {
+      await ensurePageReady(page);
+    } catch {
+      log("Frame recovery failed after datepicker click, will retry via navigateToSchedule.");
+      return true; // Return true so the caller tries to scrape (navigateToSchedule will handle recovery)
+    }
   }
 
-  await page.waitForSelector("table tbody tr", { timeout: 15_000 }).catch(() => {
+  try {
+    await page.waitForSelector("table tbody tr", { timeout: 15_000 });
+  } catch {
     log("No slots table after clicking date in datepicker.");
-  });
+  }
   await sleep(1000);
   return true;
 }
@@ -412,53 +481,76 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     const dtResult = await page.evaluate((mo) => {
       try {
         const jq = (window as any).jQuery;
-        if (!jq) return { method: "no-jquery" as const };
+        if (!jq) return { method: "no-jquery" };
+        if (!jq.fn?.dataTable) return { method: "no-datatables-plugin" };
 
-        let dt: any;
-        try {
-          dt = jq("table").DataTable();
-        } catch {
-          return { method: "not-datatables" as const };
-        }
+        // Try multiple selectors for the DataTable
+        const selectors = ["table.dataTable", "#DataTables_Table_0", ".table", "table"];
+        for (const sel of selectors) {
+          try {
+            const $table = jq(sel);
+            if (!$table.length) continue;
+            const dt = $table.DataTable();
+            const info = dt.page.info();
+            if (!info || info.pages <= 0) continue;
 
-        const info = dt.page.info();
-        if (!info || info.pages <= 0) return { method: "no-pages" as const };
+            const allRows: { dateText: string; instructor: string; rowIndex: number; page: number; monthOffset: number }[] = [];
+            const origPage = info.page;
 
-        const allRows: { dateText: string; instructor: string; rowIndex: number; page: number; monthOffset: number }[] = [];
-        const origPage = info.page;
-
-        for (let p = 0; p < info.pages; p++) {
-          dt.page(p).draw(false);
-          const rows = document.querySelectorAll("table tbody tr");
-          rows.forEach((row, idx) => {
-            const cells = row.querySelectorAll("td");
-            if (cells.length >= 2) {
-              const dateText = cells[0]?.textContent?.trim() ?? "";
-              const instructor = cells[1]?.textContent?.trim() ?? "";
-              if (dateText && /^\w{3},\s+\w{3}\s+\d/.test(dateText)) {
-                allRows.push({ dateText, instructor, rowIndex: idx, page: p + 1, monthOffset: mo });
-              }
+            for (let p = 0; p < info.pages; p++) {
+              dt.page(p).draw(false);
+              const rows = document.querySelectorAll("table tbody tr");
+              rows.forEach((row, idx) => {
+                const cells = row.querySelectorAll("td");
+                if (cells.length >= 2) {
+                  const dateText = cells[0]?.textContent?.trim() ?? "";
+                  const instructor = cells[1]?.textContent?.trim() ?? "";
+                  if (dateText && /^\w{3},\s+\w{3}\s+\d/.test(dateText)) {
+                    allRows.push({ dateText, instructor, rowIndex: idx, page: p + 1, monthOffset: mo });
+                  }
+                }
+              });
             }
-          });
+
+            // Restore original page
+            dt.page(origPage).draw(false);
+
+            return { method: "datatables", selector: sel, rows: allRows, pages: info.pages, recordsTotal: info.recordsTotal };
+          } catch { /* try next selector */ }
         }
-
-        // Restore original page
-        dt.page(origPage).draw(false);
-
-        return { method: "datatables" as const, rows: allRows, pages: info.pages, recordsTotal: info.recordsTotal };
+        return { method: "dt-no-match" };
       } catch (e: any) {
-        return { method: "dt-error" as const, error: e?.message ?? String(e) };
+        return { method: "dt-error", error: e?.message ?? String(e) };
       }
     }, monthOff);
 
-    if (dtResult.method === "datatables" && "rows" in dtResult && dtResult.rows.length > 0) {
-      totalNew = addSlots(dtResult.rows);
-      log(`${label}: DataTables API → ${dtResult.rows.length} rows across ${dtResult.pages} pages, ${totalNew} new [${monthSummary(dtResult.rows)}]`);
+    if (dtResult.method === "datatables" && "rows" in dtResult && dtResult.rows!.length > 0) {
+      totalNew = addSlots(dtResult.rows!);
+      log(`${label}: DataTables API (${dtResult.selector}) → ${dtResult.rows!.length} rows across ${dtResult.pages} pages, ${totalNew} new [${monthSummary(dtResult.rows!)}]`);
       log(`${label} done: ${totalNew} new, ${allSlots.length} unique overall`);
       return totalNew;
     }
 
-    log(`${label}: DataTables unavailable (${dtResult.method}${"error" in dtResult ? `: ${dtResult.error}` : ""}), using pagination fallback`);
+    // Diagnostic: log what pagination elements exist on the page
+    const pageDiag = await page.evaluate(() => {
+      const links = document.querySelectorAll("a");
+      const pageLinks: string[] = [];
+      for (const link of links) {
+        const text = link.textContent?.trim() || "";
+        const href = link.getAttribute("href") || "";
+        if (/^\d+$/.test(text) || text === ">" || text === "<" || href.includes("page=")) {
+          pageLinks.push(`"${text}" href="${href.substring(0, 80)}"`);
+        }
+      }
+      const hasJquery = typeof (window as any).jQuery !== "undefined";
+      const hasDtPlugin = hasJquery && !!(window as any).jQuery.fn?.dataTable;
+      const tableCount = document.querySelectorAll("table").length;
+      const tbodyRows = document.querySelectorAll("table tbody tr").length;
+      return { pageLinks, hasJquery, hasDtPlugin, tableCount, tbodyRows };
+    });
+
+    log(`${label}: DT unavailable (${dtResult.method}${"error" in dtResult ? `: ${dtResult.error}` : ""}). jQuery:${pageDiag.hasJquery} DT-plugin:${pageDiag.hasDtPlugin} tables:${pageDiag.tableCount} rows:${pageDiag.tbodyRows}`);
+    log(`${label}: page links found: ${pageDiag.pageLinks.join(", ") || "none"}`);
 
     // Strategy 2: Fall back to page-by-page scraping with goToPage
     const page1Slots = await scrapeCurrentPage(page, 1, monthOff);
