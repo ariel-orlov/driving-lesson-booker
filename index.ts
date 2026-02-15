@@ -115,18 +115,39 @@ function sleep(ms: number): Promise<void> {
 
 async function sendDiscord(webhookUrl: string, message: string): Promise<void> {
   if (!webhookUrl) return;
-  try {
-    const truncated = message.length > 1900 ? message.substring(0, 1900) + "\n..." : message;
-    const resp = await fetch(webhookUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ content: truncated }),
-    });
-    if (!resp.ok && resp.status !== 204) {
-      log(`Discord send failed: ${resp.status}`);
+
+  // Split long messages into chunks at line boundaries
+  const chunks: string[] = [];
+  if (message.length <= 1900) {
+    chunks.push(message);
+  } else {
+    const lines = message.split("\n");
+    let current = "";
+    for (const line of lines) {
+      if (current.length + line.length + 1 > 1900) {
+        chunks.push(current);
+        current = line;
+      } else {
+        current += (current ? "\n" : "") + line;
+      }
     }
-  } catch (err) {
-    log(`Discord send error: ${err}`);
+    if (current) chunks.push(current);
+  }
+
+  for (const chunk of chunks) {
+    try {
+      const resp = await fetch(webhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: chunk }),
+      });
+      if (!resp.ok && resp.status !== 204) {
+        log(`Discord send failed: ${resp.status}`);
+      }
+      if (chunks.length > 1) await sleep(500); // rate limit
+    } catch (err) {
+      log(`Discord send error: ${err}`);
+    }
   }
 }
 
@@ -206,32 +227,22 @@ async function scrapeCurrentPage(page: Page, pageNum: number, monthOff: number =
   }, pageNum, monthOff);
 }
 
-async function getPageLinks(page: Page): Promise<{ maxPage: number; nextUrl: string | null; pageUrls: Record<number, string> }> {
+async function getMaxPage(page: Page): Promise<number> {
   return page.evaluate(() => {
     let maxPage = 1;
-    let nextUrl: string | null = null;
-    const pageUrls: Record<number, string> = {};
-
     const links = document.querySelectorAll("a");
     for (const link of links) {
       const href = link.href || "";
       const rawHref = link.getAttribute("href") || "";
-      const text = link.textContent?.trim() || "";
       if (!href || rawHref.startsWith("javascript:")) continue;
 
       const pageMatch = href.match(/[?&]page=(\d+)/);
       if (pageMatch) {
-        const pageNum = parseInt(pageMatch[1], 10);
-        if (pageNum > maxPage) maxPage = pageNum;
-        pageUrls[pageNum] = href;
-
-        if (text === ">") {
-          nextUrl = href;
-        }
+        const num = parseInt(pageMatch[1], 10);
+        if (num > maxPage) maxPage = num;
       }
     }
-
-    return { maxPage, nextUrl, pageUrls };
+    return maxPage;
   });
 }
 
@@ -265,10 +276,6 @@ async function goToPage(page: Page, targetPage: number): Promise<boolean> {
   ]);
   await sleep(1000);
   return true;
-}
-
-async function clickToPage(page: Page, targetPage: number): Promise<boolean> {
-  return goToPage(page, targetPage);
 }
 
 async function clickNextMonth(page: Page): Promise<boolean> {
@@ -361,12 +368,12 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   }
 
   // Helper: scrape all pages in the current table view
-  async function scrapeAllPages(label: string): Promise<number> {
+  async function scrapeAllPages(label: string, monthOff: number): Promise<number> {
     let totalNew = 0;
-    const page1Slots = await scrapeCurrentPage(page, 1, 0);
+    const page1Slots = await scrapeCurrentPage(page, 1, monthOff);
     totalNew += addSlots(page1Slots);
 
-    const { maxPage } = await getPageLinks(page);
+    const maxPage = await getMaxPage(page);
     const pageLimit = Math.min(maxPage, MAX_PAGES);
     log(`${label}: pg 1 → ${page1Slots.length} slots [${monthSummary(page1Slots)}], ${pageLimit} pages`);
 
@@ -375,7 +382,7 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
         const navigated = await goToPage(page, p);
         if (!navigated) break;
 
-        const pageSlots = await scrapeCurrentPage(page, p, 0);
+        const pageSlots = await scrapeCurrentPage(page, p, monthOff);
         const nc = addSlots(pageSlots);
         totalNew += nc;
         log(`  pg ${p}: ${pageSlots.length} slots (${nc} new) [${monthSummary(pageSlots)}]`);
@@ -390,13 +397,14 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   }
 
   // 1) Scrape the default view (should contain all months currently shown)
-  await scrapeAllPages("Default");
+  await scrapeAllPages("Default", 0);
 
   // 2) Try advancing the calendar to find slots in additional months
   for (let m = 0; m < MAX_MONTHS_AHEAD; m++) {
+    const calendarOffset = m + 1;
     await navigateToSchedule(page);
     let advanced = true;
-    for (let i = 0; i <= m; i++) {
+    for (let i = 0; i < calendarOffset; i++) {
       if (!await clickNextMonth(page)) {
         advanced = false;
         break;
@@ -407,9 +415,9 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
       break;
     }
 
-    const newFound = await scrapeAllPages(`Calendar +${m + 1}`);
+    const newFound = await scrapeAllPages(`Calendar +${calendarOffset}`, calendarOffset);
     if (newFound === 0) {
-      log(`No new slots after calendar +${m + 1}. Done.`);
+      log(`No new slots after calendar +${calendarOffset}. Done.`);
       break;
     }
   }
@@ -469,7 +477,7 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
     }
 
     if (slot.page > 1) {
-      const reached = await clickToPage(page, slot.page);
+      const reached = await goToPage(page, slot.page);
       if (!reached) {
         log(`Could not navigate to page ${slot.page} for booking.`);
         return false;
