@@ -321,233 +321,49 @@ async function getMaxPage(page: Page): Promise<number> {
 }
 
 async function goToPage(page: Page, targetPage: number): Promise<boolean> {
-  // Log diagnostic info about pagination links (first call only)
-  const linkDiag = await page.evaluate((target) => {
+  // Click the pagination link and wait for full page navigation.
+  // These are regular <a href> links — NOT AJAX. Use the same
+  // Promise.all([waitForNavigation, click]) pattern that works for login & datepicker.
+  const linkExists = await page.evaluate((target) => {
     const links = document.querySelectorAll("a");
     for (const link of links) {
       const text = link.textContent?.trim();
       if (text === String(target) && (link.getAttribute("href")?.includes("page=") || link.href?.includes("page="))) {
-        return {
-          text,
-          href: link.getAttribute("href"),
-          fullHref: link.href,
-          dataAjax: link.getAttribute("data-ajax"),
-          dataAjaxUpdate: link.getAttribute("data-ajax-update"),
-          dataAjaxMode: link.getAttribute("data-ajax-mode"),
-          allDataAttrs: Array.from(link.attributes)
-            .filter(a => a.name.startsWith("data-"))
-            .map(a => `${a.name}="${a.value}"`)
-            .join(" "),
-        };
+        link.scrollIntoView({ block: "center" });
+        return true;
       }
     }
-    return null;
+    return false;
   }, targetPage);
-  log(`Page ${targetPage} link: ${linkDiag ? JSON.stringify(linkDiag) : "not found"}`);
 
-  if (!linkDiag) {
+  if (!linkExists) {
     log(`No page link found for page ${targetPage}`);
     return false;
   }
 
-  // Strategy 1: Trusted mouse click at raw coordinates + wait for XHR response
-  // page.mouse.click() produces trusted events that trigger jquery.unobtrusive-ajax handlers
-  // unlike element.click() or jQuery.trigger('click') which create untrusted synthetic events
   try {
-    // Find the link element handle
-    const linkHandle = await page.evaluateHandle((target) => {
-      const links = document.querySelectorAll("a");
-      for (const link of links) {
-        const text = link.textContent?.trim();
-        if (text === String(target) && (link.getAttribute("href")?.includes("page=") || link.href?.includes("page="))) {
-          link.scrollIntoView({ block: "center", inline: "center" });
-          return link;
-        }
-      }
-      return null;
-    }, targetPage);
-
-    const element = linkHandle.asElement();
-    if (element) {
-      await sleep(300); // let scroll settle
-      const box = await element.boundingBox();
-      if (box) {
-        // Capture current first-row text to detect DOM changes
-        const prevFirstRow = await page.evaluate(() =>
-          document.querySelector("table tbody tr td")?.textContent?.trim() || ""
-        );
-
-        // Set up response listener BEFORE clicking
-        const responsePromise = page.waitForResponse(
-          (resp) => {
-            const url = resp.url();
-            return (url.includes("page=") || url.includes("Lessons") || url.includes("BtwScheduling"))
-              && resp.request().resourceType() !== "image";
-          },
-          { timeout: 10_000 },
-        ).catch(() => null);
-
-        // Click at center of element using raw mouse coordinates (trusted event)
-        const x = box.x + box.width / 2;
-        const y = box.y + box.height / 2;
-        log(`Mouse click page ${targetPage} at (${Math.round(x)}, ${Math.round(y)})`);
-        await page.mouse.click(x, y);
-
-        // Wait for AJAX response
-        const resp = await responsePromise;
-        if (resp) {
-          log(`  XHR response for page ${targetPage}: ${resp.status()} (${resp.url().substring(0, 100)})`);
-          await sleep(1000); // let DOM update from response
-          return true;
-        }
-
-        // No XHR detected — wait for DOM mutation instead
-        try {
-          await page.waitForFunction(
-            (prev: string) => {
-              const cell = document.querySelector("table tbody tr td");
-              return cell && cell.textContent?.trim() !== prev;
-            },
-            { timeout: 8000, polling: "mutation" },
-            prevFirstRow,
-          );
-          log(`  DOM changed for page ${targetPage} (mutation detected)`);
-          await sleep(500);
-          return true;
-        } catch {
-          log(`  No DOM change detected after mouse click for page ${targetPage}`);
-        }
-      }
-    }
-  } catch (err) {
-    log(`  Mouse click strategy failed for page ${targetPage}: ${err}`);
-  }
-
-  // Strategy 2: Direct fetch with XHR headers + inject HTML into container
-  // This mimics what jquery.unobtrusive-ajax does: fetch the URL with XMLHttpRequest header,
-  // server returns partial HTML, inject it into the data-ajax-update container
-  try {
-    const fetchResult = await page.evaluate(async (target) => {
-      const links = document.querySelectorAll("a");
-      for (const link of links) {
-        const text = link.textContent?.trim();
-        if (text !== String(target)) continue;
-        const href = link.href;
-        if (!href || !href.includes("page=")) continue;
-
-        const updateTarget = link.getAttribute("data-ajax-update");
-
-        try {
-          const resp = await fetch(href, {
-            headers: {
-              "X-Requested-With": "XMLHttpRequest",
-              "Accept": "text/html, */*; q=0.01",
-            },
-            credentials: "same-origin",
-          });
-          if (!resp.ok) return `fetch-error: ${resp.status}`;
-          const html = await resp.text();
-          if (!html || html.length < 50) return `fetch-empty: ${html.length} chars`;
-
-          // Inject into the data-ajax-update container (or common containers)
-          const containers = updateTarget
-            ? [updateTarget]
-            : ["#scheduleContent", "#content", ".table-responsive", "[data-ajax-update]"];
-          for (const sel of containers) {
-            const el = document.querySelector(sel);
-            if (el) {
-              el.innerHTML = html;
-              return `injected into ${sel} (${html.length} chars)`;
-            }
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30_000 }),
+      page.evaluate((target) => {
+        const links = document.querySelectorAll("a");
+        for (const link of links) {
+          const text = link.textContent?.trim();
+          if (text === String(target) && (link.getAttribute("href")?.includes("page=") || link.href?.includes("page="))) {
+            link.click();
+            return;
           }
-
-          // Last resort: find the table's parent and replace
-          const table = document.querySelector("table");
-          if (table?.parentElement) {
-            table.parentElement.innerHTML = html;
-            return `injected into table parent (${html.length} chars)`;
-          }
-
-          return "no-container-found";
-        } catch (err) {
-          return `fetch-exception: ${err}`;
         }
-      }
-      return "link-not-found";
-    }, targetPage);
+      }, targetPage),
+    ]);
 
-    log(`  Direct fetch page ${targetPage}: ${fetchResult}`);
-    if (fetchResult?.startsWith("injected")) {
-      await sleep(500);
-      return true;
-    }
+    await page.waitForSelector("table tbody tr", { timeout: 15_000 }).catch(() => {});
+    await sleep(1000);
+    log(`Navigated to page ${targetPage} (URL: ${page.url().substring(0, 120)})`);
+    return true;
   } catch (err) {
-    log(`  Direct fetch strategy failed for page ${targetPage}: ${err}`);
+    log(`goToPage ${targetPage} navigation failed: ${err}`);
+    return false;
   }
-
-  // Strategy 3: Hide sticky/fixed elements, then use Puppeteer page.click()
-  // Metronic theme has sticky headers that can intercept Puppeteer's click
-  try {
-    // Tag the link with a unique ID
-    const tagged = await page.evaluate((target) => {
-      const links = document.querySelectorAll("a");
-      for (const link of links) {
-        if (link.textContent?.trim() === String(target) &&
-            (link.getAttribute("href")?.includes("page=") || link.href?.includes("page="))) {
-          link.id = "__paginationTarget";
-          // Hide all fixed/sticky elements
-          document.querySelectorAll("*").forEach((el) => {
-            const style = getComputedStyle(el);
-            if (style.position === "fixed" || style.position === "sticky") {
-              (el as HTMLElement).style.setProperty("display", "none", "important");
-            }
-          });
-          return true;
-        }
-      }
-      return false;
-    }, targetPage);
-
-    if (tagged) {
-      const responsePromise = page.waitForResponse(
-        (resp) => resp.url().includes("page=") || resp.url().includes("Lessons"),
-        { timeout: 10_000 },
-      ).catch(() => null);
-
-      await page.click("#__paginationTarget");
-
-      const resp = await responsePromise;
-      if (resp) {
-        log(`  page.click() response for page ${targetPage}: ${resp.status()}`);
-        await sleep(1000);
-      } else {
-        await sleep(3000);
-      }
-
-      // Restore visibility
-      await page.evaluate(() => {
-        document.querySelectorAll("*").forEach((el) => {
-          (el as HTMLElement).style.removeProperty("display");
-        });
-        const target = document.getElementById("__paginationTarget");
-        if (target) target.removeAttribute("id");
-      });
-      return true;
-    }
-  } catch (err) {
-    log(`  page.click() strategy failed for page ${targetPage}: ${err}`);
-    // Restore visibility on error
-    await page.evaluate(() => {
-      document.querySelectorAll("*").forEach((el) => {
-        (el as HTMLElement).style.removeProperty("display");
-      });
-      const target = document.getElementById("__paginationTarget");
-      if (target) target.removeAttribute("id");
-    }).catch(() => {});
-  }
-
-  log(`All pagination strategies failed for page ${targetPage}`);
-  return false;
 }
 
 async function advanceDatepicker(page: Page): Promise<boolean> {
@@ -663,79 +479,85 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     return Object.entries(byMonth).map(([m, c]) => `${m}:${c}`).join(" ");
   }
 
-  // Helper: scrape all pages using full browser navigation (page.goto).
-  // fetch() doesn't work because the server ignores ?page=N in AJAX requests —
-  // the table is populated by JavaScript after page load, so we need full navigation.
+  // Helper: scrape all pages by CLICKING pagination links on the loaded page.
+  // page.goto() and fetch() both fail — the server ignores ?page=N on fresh requests.
+  // Clicking the link on the page triggers proper full-page navigation with correct
+  // session context, just like a real user clicking. Uses the same Promise.all
+  // pattern that works for login (line 194) and datepicker (line 607).
   async function scrapeAllPages(label: string, monthOff: number): Promise<number> {
     let totalNew = 0;
 
     // Scrape page 1 from the already-loaded DOM
     const page1Slots = await scrapeCurrentPage(page, 1, monthOff);
     totalNew += addSlots(page1Slots);
-    log(`${label}: pg 1 -> ${page1Slots.length} slots [${monthSummary(page1Slots)}]`);
+    const p1sample = page1Slots.slice(0, 3).map(s => s.dateText).join(" | ");
+    log(`${label}: pg 1 -> ${page1Slots.length} slots [${monthSummary(page1Slots)}] sample: ${p1sample}`);
 
-    // Find max page number and the base URL pattern from pagination links
-    const pageInfo = await page.evaluate(() => {
-      let maxPage = 1;
-      const pageUrls: string[] = [];
-      const links = document.querySelectorAll("a");
-      for (const link of links) {
-        const href = link.getAttribute("href") || "";
-        const fullHref = link.href || "";
-        if (href.includes("page=") || fullHref.includes("page=")) {
-          const match = (fullHref || href).match(/[?&]page=(\d+)/);
-          if (match) {
-            const num = parseInt(match[1], 10);
-            if (num > maxPage) maxPage = num;
-            if (!pageUrls.includes(fullHref)) pageUrls.push(fullHref);
-          }
-        }
-      }
-      return { maxPage, pageUrls };
-    });
+    // Find max page number from pagination links
+    const maxPage = await getMaxPage(page);
+    log(`${label}: maxPage=${maxPage}`);
 
-    log(`${label}: maxPage=${pageInfo.maxPage}, ${pageInfo.pageUrls.length} page URLs found`);
-
-    if (pageInfo.maxPage <= 1) {
+    if (maxPage <= 1) {
       log(`${label} done (single page): ${totalNew} new, ${allSlots.length} unique overall`);
       return totalNew;
     }
 
-    // Navigate the actual browser to each page URL (full page load with JS execution).
-    // This is the ONLY approach that works because the server populates the table
-    // via JavaScript after page load — fetch() always returns page 1 data.
-    for (let p = 2; p <= Math.min(pageInfo.maxPage, MAX_PAGES); p++) {
+    // Click each pagination link in sequence — full page navigation, not AJAX
+    for (let p = 2; p <= Math.min(maxPage, MAX_PAGES); p++) {
       try {
-        // Build the page URL — use the first found URL as template
-        let pageUrl = "";
-        for (const url of pageInfo.pageUrls) {
-          if (url.includes(`page=${p}`)) { pageUrl = url; break; }
-        }
-        if (!pageUrl && pageInfo.pageUrls.length > 0) {
-          pageUrl = pageInfo.pageUrls[0].replace(/page=\d+/, `page=${p}`);
-        }
-        if (!pageUrl) {
-          log(`${label}: no URL for page ${p}`);
+        // Check if the page link exists
+        const linkExists = await page.evaluate((target) => {
+          const links = document.querySelectorAll("a");
+          for (const link of links) {
+            const text = link.textContent?.trim();
+            if (text === String(target) && (link.getAttribute("href")?.includes("page=") || link.href?.includes("page="))) {
+              return true;
+            }
+          }
+          return false;
+        }, p);
+
+        if (!linkExists) {
+          log(`${label}: no link for page ${p}, stopping`);
           break;
         }
 
-        log(`${label}: navigating to page ${p}: ${pageUrl.substring(0, 120)}`);
-        await page.goto(pageUrl, { waitUntil: "networkidle2", timeout: 30_000 });
+        // Click the page link and wait for full navigation (same as login/datepicker pattern)
+        await Promise.all([
+          page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30_000 }),
+          page.evaluate((target) => {
+            const links = document.querySelectorAll("a");
+            for (const link of links) {
+              const text = link.textContent?.trim();
+              if (text === String(target) && (link.getAttribute("href")?.includes("page=") || link.href?.includes("page="))) {
+                link.click();
+                return;
+              }
+            }
+          }, p),
+        ]);
+
         await page.waitForSelector("table tbody tr", { timeout: 15_000 }).catch(() => {});
         await sleep(1000);
+
+        // Log current URL to verify navigation actually happened
+        const currentUrl = page.url();
+        log(`${label}: pg ${p} URL: ${currentUrl.substring(0, 120)}`);
 
         const pageSlots = await scrapeCurrentPage(page, p, monthOff);
         const nc = addSlots(pageSlots);
         totalNew += nc;
-        log(`${label}: pg ${p} -> ${pageSlots.length} slots (${nc} new) [${monthSummary(pageSlots)}]`);
+        const sample = pageSlots.slice(0, 3).map(s => s.dateText).join(" | ");
+        log(`${label}: pg ${p} -> ${pageSlots.length} slots (${nc} new) [${monthSummary(pageSlots)}] sample: ${sample}`);
 
         if (pageSlots.length === 0) {
           log(`${label}: page ${p} had no slots, stopping pagination`);
           break;
         }
       } catch (err) {
-        log(`${label}: pg ${p} navigation error: ${err}`);
-        continue;
+        log(`${label}: pg ${p} error: ${err}`);
+        // Navigation failed — page state is unreliable, stop paginating
+        break;
       }
     }
 
@@ -863,72 +685,34 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
       log(`Found slot on page 1: ${slot.dateText}`);
     }
 
-    // If not on page 1, get pagination base URL and fetch other pages
+    // If not on page 1, click through pagination links to find the slot
     if (!slotClicked) {
-      const bookPageInfo = await page.evaluate(() => {
-        const links = document.querySelectorAll("a");
-        let maxPage = 1;
-        let baseUrl = "";
-        for (const link of links) {
-          const text = link.textContent?.trim() || "";
-          const fullHref = link.href || "";
-          if (/^\d+$/.test(text) && fullHref.includes("page=")) {
-            const num = parseInt(text, 10);
-            if (num > maxPage) maxPage = num;
-            if (!baseUrl) baseUrl = fullHref.replace(/([?&])page=\d+/, "$1page=__PAGE__");
-          }
-        }
-        // Also find the data-ajax-update target container
-        const ajaxLink = document.querySelector("a[data-ajax-update]");
-        const updateTarget = ajaxLink?.getAttribute("data-ajax-update") || null;
-        return { maxPage, baseUrl, updateTarget };
-      });
+      const bookMaxPage = await getMaxPage(page);
 
-      if (bookPageInfo.baseUrl) {
-        const pagesToTry = slot.page > 1
-          ? [slot.page, ...Array.from({ length: bookPageInfo.maxPage }, (_, i) => i + 1).filter(p => p !== slot.page)]
-          : Array.from({ length: bookPageInfo.maxPage - 1 }, (_, i) => i + 2);
+      // Try the slot's known page first, then other pages
+      const pagesToTry = slot.page > 1
+        ? [slot.page, ...Array.from({ length: bookMaxPage }, (_, i) => i + 1).filter(p => p !== slot.page && p !== 1)]
+        : Array.from({ length: bookMaxPage - 1 }, (_, i) => i + 2);
 
-        for (const p of pagesToTry) {
-          // Fetch page HTML and inject into DOM so we can click the slot link
-          const injected = await page.evaluate(async (url, target) => {
-            try {
-              const resp = await fetch(url, {
-                headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "text/html, */*; q=0.01" },
-                credentials: "same-origin",
-              });
-              if (!resp.ok) return false;
-              const html = await resp.text();
-              const containers = target ? [target] : [".table-responsive", "#scheduleContent", "#content"];
-              for (const sel of containers) {
-                const el = document.querySelector(sel);
-                if (el) { el.innerHTML = html; return true; }
-              }
-              const table = document.querySelector("table");
-              if (table?.parentElement) { table.parentElement.innerHTML = html; return true; }
-              return false;
-            } catch { return false; }
-          }, bookPageInfo.baseUrl.replace("__PAGE__", String(p)), bookPageInfo.updateTarget);
+      for (const p of pagesToTry) {
+        const navigated = await goToPage(page, p);
+        if (!navigated) continue;
 
-          if (!injected) continue;
-          await sleep(500);
-
-          slotClicked = await page.evaluate((targetDate) => {
-            const rows = document.querySelectorAll("table tbody tr");
-            for (const row of rows) {
-              const firstCell = row.querySelector("td:first-child a");
-              if (firstCell && firstCell.textContent?.trim() === targetDate) {
-                (firstCell as HTMLElement).click();
-                return true;
-              }
+        slotClicked = await page.evaluate((targetDate) => {
+          const rows = document.querySelectorAll("table tbody tr");
+          for (const row of rows) {
+            const firstCell = row.querySelector("td:first-child a");
+            if (firstCell && firstCell.textContent?.trim() === targetDate) {
+              (firstCell as HTMLElement).click();
+              return true;
             }
-            return false;
-          }, slot.dateText);
-
-          if (slotClicked) {
-            log(`Found slot on page ${p}: ${slot.dateText}`);
-            break;
           }
+          return false;
+        }, slot.dateText);
+
+        if (slotClicked) {
+          log(`Found slot on page ${p}: ${slot.dateText}`);
+          break;
         }
       }
     }
