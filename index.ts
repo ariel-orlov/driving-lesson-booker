@@ -663,8 +663,7 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     return Object.entries(byMonth).map(([m, c]) => `${m}:${c}`).join(" ");
   }
 
-  // Helper: scrape all pages by fetching each page's HTML directly via HTTP.
-  // This bypasses all DOM click/navigation issues — just direct HTTP requests.
+  // Helper: scrape all pages — uses multiple strategies to get every single slot.
   async function scrapeAllPages(label: string, monthOff: number): Promise<number> {
     let totalNew = 0;
 
@@ -673,94 +672,301 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     totalNew += addSlots(page1Slots);
     log(`${label}: pg 1 -> ${page1Slots.length} slots [${monthSummary(page1Slots)}]`);
 
-    // Get the base URL and max page from pagination links
-    const pageInfo = await page.evaluate(() => {
-      const links = document.querySelectorAll("a");
-      let maxPage = 1;
-      let baseUrl = "";
-      const linkDetails: string[] = [];
+    // === DIAGNOSTIC: Dump everything about the page to help debug pagination ===
+    const diag = await page.evaluate(() => {
+      const r: Record<string, any> = {};
 
-      for (const link of links) {
-        const text = link.textContent?.trim() || "";
+      // Current URL
+      r.url = window.location.href;
+
+      // Table info
+      const rows = document.querySelectorAll("table tbody tr");
+      r.tableRows = rows.length;
+
+      // ALL links on the page that mention "page"
+      const pageLinks: any[] = [];
+      const allLinks = document.querySelectorAll("a");
+      for (const link of allLinks) {
         const href = link.getAttribute("href") || "";
         const fullHref = link.href || "";
-        if (/^\d+$/.test(text) && (href.includes("page=") || fullHref.includes("page="))) {
-          const num = parseInt(text, 10);
-          if (num > maxPage) maxPage = num;
-          // Extract the base URL (everything before page=N)
-          if (!baseUrl && fullHref) {
-            baseUrl = fullHref.replace(/([?&])page=\d+/, "$1page=__PAGE__");
-          }
-          linkDetails.push(`"${text}" href="${href}" data-ajax="${link.getAttribute("data-ajax")}" data-ajax-update="${link.getAttribute("data-ajax-update")}"`);
+        const text = link.textContent?.trim() || "";
+        if (href.includes("page=") || fullHref.includes("page=")) {
+          pageLinks.push({
+            text,
+            href,
+            fullHref: fullHref.substring(0, 150),
+            dataAjax: link.getAttribute("data-ajax"),
+            dataAjaxUpdate: link.getAttribute("data-ajax-update"),
+            dataAjaxMode: link.getAttribute("data-ajax-mode"),
+            dataAttrs: Array.from(link.attributes)
+              .filter(a => a.name.startsWith("data-"))
+              .map(a => `${a.name}="${a.value}"`).join(" "),
+          });
         }
       }
-      return { maxPage, baseUrl, linkDetails };
+      r.pageLinks = pageLinks;
+
+      // Links with text that looks like page numbers (1, 2, 3, >, >>)
+      const navLinks: any[] = [];
+      for (const link of allLinks) {
+        const text = link.textContent?.trim() || "";
+        if (/^[\d>»›<«‹]+$/.test(text) || text === "Next" || text === "Prev") {
+          navLinks.push({
+            text,
+            href: link.getAttribute("href"),
+            fullHref: (link.href || "").substring(0, 150),
+            dataAttrs: Array.from(link.attributes)
+              .filter(a => a.name.startsWith("data-"))
+              .map(a => `${a.name}="${a.value}"`).join(" "),
+          });
+        }
+      }
+      r.navLinks = navLinks;
+
+      // jQuery info
+      const win = window as any;
+      r.jQuery = typeof win.jQuery !== "undefined";
+      r.jQueryVersion = win.jQuery?.fn?.jquery;
+
+      // All data-ajax elements
+      const ajaxEls = document.querySelectorAll("[data-ajax]");
+      r.dataAjaxElements = Array.from(ajaxEls).map(el => ({
+        tag: el.tagName,
+        text: (el.textContent?.trim() || "").substring(0, 50),
+        attrs: Array.from(el.attributes)
+          .filter(a => a.name.startsWith("data-"))
+          .map(a => `${a.name}="${a.value}"`).join(" "),
+        href: el.getAttribute("href"),
+      }));
+
+      // HTML around the table (pagination area)
+      const table = document.querySelector("table");
+      if (table) {
+        const parent = table.parentElement;
+        r.tableParent = parent ? `${parent.tagName}#${(parent as HTMLElement).id}.${parent.className}` : "none";
+        // Sibling elements after table
+        const siblings: string[] = [];
+        let sib = table.nextElementSibling;
+        while (sib) {
+          siblings.push(`${sib.tagName}.${sib.className}: ${sib.outerHTML.substring(0, 200)}`);
+          sib = sib.nextElementSibling;
+        }
+        r.tableSiblings = siblings;
+
+        // Sibling elements after table's parent
+        if (parent) {
+          const parentSiblings: string[] = [];
+          let psib = parent.nextElementSibling;
+          while (psib) {
+            parentSiblings.push(`${psib.tagName}.${psib.className}: ${psib.outerHTML.substring(0, 200)}`);
+            psib = psib.nextElementSibling;
+          }
+          r.tableParentSiblings = parentSiblings;
+        }
+      }
+
+      // "Show entries" dropdown (common in DataTable-style UIs)
+      const selects = document.querySelectorAll("select");
+      r.selects = Array.from(selects).map(s => ({
+        name: s.name,
+        id: s.id,
+        options: Array.from(s.options).map(o => `${o.value}:${o.text}`).join(", "),
+        className: s.className,
+      }));
+
+      return r;
     });
 
-    log(`${label}: maxPage=${pageInfo.maxPage} baseUrl=${pageInfo.baseUrl || "none"}`);
-    log(`${label}: links: ${pageInfo.linkDetails.join(", ") || "none"}`);
+    // Send diagnostics to Discord so we can see what's happening on Railway
+    const diagMsg = [
+      `🔍 **Pagination Diagnostics** (${label})`,
+      `URL: ${diag.url}`,
+      `Table rows: ${diag.tableRows}`,
+      `jQuery: ${diag.jQuery} v${diag.jQueryVersion || "n/a"}`,
+      `Page links (${diag.pageLinks.length}): ${JSON.stringify(diag.pageLinks).substring(0, 800)}`,
+      `Nav links (${diag.navLinks.length}): ${JSON.stringify(diag.navLinks).substring(0, 800)}`,
+      `data-ajax elements (${diag.dataAjaxElements.length}): ${JSON.stringify(diag.dataAjaxElements).substring(0, 800)}`,
+      `Table parent: ${diag.tableParent}`,
+      `Table siblings: ${JSON.stringify(diag.tableSiblings || []).substring(0, 500)}`,
+      `Parent siblings: ${JSON.stringify(diag.tableParentSiblings || []).substring(0, 500)}`,
+      `Selects: ${JSON.stringify(diag.selects).substring(0, 300)}`,
+    ].join("\n");
+    log(diagMsg);
+    await notifyLog(diagMsg);
 
-    if (!pageInfo.baseUrl || pageInfo.maxPage <= 1) {
-      log(`${label} done (single page): ${totalNew} new, ${allSlots.length} unique overall`);
-      return totalNew;
+    // === STRATEGY A: Direct fetch using pagination link URLs ===
+    // Find page links and their URLs
+    const pageUrls: string[] = [];
+    if (diag.pageLinks.length > 0) {
+      // Use the full URLs from the page links
+      const seen = new Set<string>();
+      for (const pl of diag.pageLinks) {
+        const url = pl.fullHref || pl.href;
+        if (url && !seen.has(url)) {
+          seen.add(url);
+          pageUrls.push(url);
+        }
+      }
     }
 
-    // Fetch pages 2+ directly via HTTP — no clicking needed
-    const pageLimit = Math.min(pageInfo.maxPage, MAX_PAGES);
-    for (let p = 2; p <= pageLimit; p++) {
-      try {
-        const fetchUrl = pageInfo.baseUrl.replace("__PAGE__", String(p));
+    if (pageUrls.length > 0) {
+      log(`${label}: Found ${pageUrls.length} page URLs to fetch`);
+      for (let i = 0; i < pageUrls.length; i++) {
+        const fetchUrl = pageUrls[i];
+        log(`${label}: Fetching page URL: ${fetchUrl.substring(0, 120)}`);
+        try {
+          const fetchResult = await page.evaluate(async (url) => {
+            try {
+              const resp = await fetch(url, {
+                headers: {
+                  "X-Requested-With": "XMLHttpRequest",
+                  "Accept": "text/html, */*; q=0.01",
+                },
+                credentials: "same-origin",
+              });
+              const html = await resp.text();
+              return {
+                status: resp.status,
+                length: html.length,
+                preview: html.substring(0, 300),
+                html,
+              };
+            } catch (err) {
+              return { status: 0, length: 0, preview: String(err), html: "" };
+            }
+          }, fetchUrl);
 
-        // Fetch the page HTML directly from the server
-        const fetchResult = await page.evaluate(async (url) => {
-          try {
+          log(`${label}: fetch status=${fetchResult.status} length=${fetchResult.length} preview=${fetchResult.preview.substring(0, 150)}`);
+
+          if (fetchResult.status === 200 && fetchResult.html.length > 50) {
+            // Parse slots from fetched HTML
+            const pageSlots = await page.evaluate((html, mo) => {
+              const parser = new DOMParser();
+              const doc = parser.parseFromString(html, "text/html");
+              const rows = doc.querySelectorAll("table tbody tr, tr");
+              const slots: { dateText: string; instructor: string; rowIndex: number; page: number; monthOffset: number }[] = [];
+              rows.forEach((row, idx) => {
+                const cells = row.querySelectorAll("td");
+                if (cells.length >= 2) {
+                  const dateText = cells[0]?.textContent?.trim() ?? "";
+                  const instructor = cells[1]?.textContent?.trim() ?? "";
+                  if (dateText && /^\w{3},\s+\w{3}\s+\d/.test(dateText)) {
+                    slots.push({ dateText, instructor, rowIndex: idx, page: idx, monthOffset: mo });
+                  }
+                }
+              });
+              return slots;
+            }, fetchResult.html, monthOff);
+
+            const nc = addSlots(pageSlots);
+            totalNew += nc;
+            log(`${label}: fetched page -> ${pageSlots.length} slots (${nc} new) [${monthSummary(pageSlots)}]`);
+          }
+        } catch (err) {
+          log(`${label}: fetch error for ${fetchUrl.substring(0, 80)}: ${err}`);
+        }
+      }
+    }
+
+    // === STRATEGY B: Try mouse-clicking pagination links ===
+    if (diag.navLinks.length > 0 && diag.pageLinks.length > 0) {
+      // Try clicking each numbered page link using trusted mouse events
+      const maxPage = Math.max(...diag.navLinks
+        .map((l: any) => parseInt(l.text, 10))
+        .filter((n: number) => !isNaN(n) && n > 0));
+
+      for (let p = 2; p <= Math.min(maxPage, MAX_PAGES); p++) {
+        try {
+          const navigated = await goToPage(page, p);
+          if (!navigated) {
+            log(`${label}: goToPage(${p}) failed`);
+            continue;
+          }
+          const pageSlots = await scrapeCurrentPage(page, p, monthOff);
+          const nc = addSlots(pageSlots);
+          totalNew += nc;
+          log(`${label}: click pg ${p} -> ${pageSlots.length} slots (${nc} new) [${monthSummary(pageSlots)}]`);
+        } catch (err) {
+          log(`${label}: click pg ${p} error: ${err}`);
+        }
+      }
+    }
+
+    // === STRATEGY C: Try different page size parameters to get all rows at once ===
+    if (totalNew <= page1Slots.length) {
+      // Pagination hasn't added any new slots — try getting all at once
+      log(`${label}: Pagination didn't find new slots. Trying all-at-once fetch...`);
+      const currentUrl = await page.evaluate(() => {
+        // Find any link with page= to use as base
+        const links = document.querySelectorAll("a");
+        for (const link of links) {
+          const href = link.href || "";
+          if (href.includes("page=")) return href.replace(/page=\d+/, "page=1");
+        }
+        return window.location.href;
+      });
+
+      // Try various page size parameter names
+      const pageSizeParams = ["pageSize=200", "length=200", "size=200", "per_page=200", "take=200", "iDisplayLength=200"];
+      for (const param of pageSizeParams) {
+        const testUrl = currentUrl.includes("?") ? `${currentUrl}&${param}` : `${currentUrl}?${param}`;
+        try {
+          const result = await page.evaluate(async (url) => {
             const resp = await fetch(url, {
-              headers: {
-                "X-Requested-With": "XMLHttpRequest",
-                "Accept": "text/html, */*; q=0.01",
-              },
+              headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "text/html, */*; q=0.01" },
               credentials: "same-origin",
             });
-            if (!resp.ok) return { error: `HTTP ${resp.status}`, html: "" };
             const html = await resp.text();
-            return { error: null, html };
-          } catch (err) {
-            return { error: String(err), html: "" };
-          }
-        }, fetchUrl);
-
-        if (fetchResult.error) {
-          log(`${label}: pg ${p} fetch error: ${fetchResult.error}`);
-          continue; // try next page, don't break
-        }
-
-        // Parse slots from the HTML response
-        const pageSlots = await page.evaluate((html, pn, mo) => {
-          const parser = new DOMParser();
-          const doc = parser.parseFromString(html, "text/html");
-          const rows = doc.querySelectorAll("table tbody tr");
-          const slots: { dateText: string; instructor: string; rowIndex: number; page: number; monthOffset: number }[] = [];
-
-          rows.forEach((row, idx) => {
-            const cells = row.querySelectorAll("td");
-            if (cells.length >= 2) {
-              const dateText = cells[0]?.textContent?.trim() ?? "";
-              const instructor = cells[1]?.textContent?.trim() ?? "";
-              if (dateText && /^\w{3},\s+\w{3}\s+\d/.test(dateText)) {
-                slots.push({ dateText, instructor, rowIndex: idx, page: pn, monthOffset: mo });
+            // Count date-like rows
+            const parser = new DOMParser();
+            const doc = parser.parseFromString(html, "text/html");
+            const rows = doc.querySelectorAll("table tbody tr, tr");
+            let dateRows = 0;
+            rows.forEach(row => {
+              const cells = row.querySelectorAll("td");
+              if (cells.length >= 2) {
+                const t = cells[0]?.textContent?.trim() ?? "";
+                if (/^\w{3},\s+\w{3}\s+\d/.test(t)) dateRows++;
               }
-            }
-          });
+            });
+            return { status: resp.status, length: html.length, dateRows };
+          }, testUrl);
 
-          return slots;
-        }, fetchResult.html, p, monthOff);
+          log(`${label}: ${param} -> status=${result.status} len=${result.length} dateRows=${result.dateRows}`);
 
-        const nc = addSlots(pageSlots);
-        totalNew += nc;
-        log(`${label}: pg ${p} -> ${pageSlots.length} slots (${nc} new) [${monthSummary(pageSlots)}]`);
-      } catch (err) {
-        log(`${label}: pg ${p} error: ${err}`);
-        continue; // try next page
+          if (result.dateRows > page1Slots.length) {
+            log(`${label}: ${param} returned MORE rows (${result.dateRows} vs ${page1Slots.length})! Scraping...`);
+            const allAtOnce = await page.evaluate(async (url, mo) => {
+              const resp = await fetch(url, {
+                headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "text/html, */*; q=0.01" },
+                credentials: "same-origin",
+              });
+              const html = await resp.text();
+              const parser = new DOMParser();
+              const doc = parser.parseFromString(html, "text/html");
+              const rows = doc.querySelectorAll("table tbody tr, tr");
+              const slots: { dateText: string; instructor: string; rowIndex: number; page: number; monthOffset: number }[] = [];
+              rows.forEach((row, idx) => {
+                const cells = row.querySelectorAll("td");
+                if (cells.length >= 2) {
+                  const dateText = cells[0]?.textContent?.trim() ?? "";
+                  const instructor = cells[1]?.textContent?.trim() ?? "";
+                  if (dateText && /^\w{3},\s+\w{3}\s+\d/.test(dateText)) {
+                    slots.push({ dateText, instructor, rowIndex: idx, page: 1, monthOffset: mo });
+                  }
+                }
+              });
+              return slots;
+            }, testUrl, monthOff);
+
+            const nc = addSlots(allAtOnce);
+            totalNew += nc;
+            log(`${label}: all-at-once -> ${allAtOnce.length} slots (${nc} new) [${monthSummary(allAtOnce)}]`);
+            break; // Found a working page size param
+          }
+        } catch (err) {
+          // silently continue
+        }
       }
     }
 
