@@ -6,6 +6,8 @@ import fs from "fs";
 // ── Config ──────────────────────────────────────────────────────────────────
 const LOGIN_URL =
   "https://www.tds.ms/CentralizeSP/Student/Login/chelmsfordautoschool";
+const BOOKED_LESSONS_URL =
+  "https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1370551";
 
 const REQUIRED_ENV = ["TDS_USERNAME", "TDS_PASSWORD", "DISCORD_WEBHOOK", "DISCORD_WEBHOOK_IMPORTANT", "DISCORD_WEBHOOK_SCAN"] as const;
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
@@ -283,6 +285,72 @@ async function navigateToSchedule(page: Page): Promise<void> {
 
   await sleep(1000);
   await screenshot(page, "02-schedule-loaded");
+}
+
+async function scrapeBookedLessons(page: Page): Promise<Set<string>> {
+  const bookedDates = new Set<string>();
+
+  try {
+    log("Checking already-booked lessons...");
+    await page.goto(BOOKED_LESSONS_URL, { waitUntil: "networkidle2", timeout: 30_000 });
+    await page.waitForSelector("table", { timeout: 10_000 }).catch(() => {});
+    await sleep(1000);
+
+    const booked = await page.evaluate(() => {
+      const rows = document.querySelectorAll("table tbody tr");
+      const lessons: string[] = [];
+      rows.forEach((row) => {
+        const cells = row.querySelectorAll("td");
+        if (cells.length >= 2) {
+          const dateText = cells[0]?.textContent?.trim() ?? "";
+          if (dateText && /\w{3},\s+\w{3}\s+\d/.test(dateText)) {
+            lessons.push(dateText);
+          }
+        }
+      });
+      return lessons;
+    });
+
+    // Handle pagination on booked lessons page
+    const maxPage = await getMaxPage(page);
+    if (maxPage > 1) {
+      for (let p = 2; p <= maxPage; p++) {
+        const navigated = await goToPage(page, p);
+        if (!navigated) break;
+
+        const pageBooked = await page.evaluate(() => {
+          const rows = document.querySelectorAll("table tbody tr");
+          const lessons: string[] = [];
+          rows.forEach((row) => {
+            const cells = row.querySelectorAll("td");
+            if (cells.length >= 2) {
+              const dateText = cells[0]?.textContent?.trim() ?? "";
+              if (dateText && /\w{3},\s+\w{3}\s+\d/.test(dateText)) {
+                lessons.push(dateText);
+              }
+            }
+          });
+          return lessons;
+        });
+        booked.push(...pageBooked);
+      }
+    }
+
+    for (const dateText of booked) {
+      bookedDates.add(dateText);
+    }
+
+    if (bookedDates.size > 0) {
+      log(`Found ${bookedDates.size} already-booked lesson(s):`);
+      for (const d of bookedDates) log(`  ↳ ${d}`);
+    } else {
+      log("No existing booked lessons found.");
+    }
+  } catch (err) {
+    log(`Error checking booked lessons: ${err}`);
+  }
+
+  return bookedDates;
 }
 
 async function scrapeCurrentPage(page: Page, pageNum: number): Promise<Slot[]> {
@@ -666,16 +734,22 @@ async function openBrowserAndScan(): Promise<boolean> {
   try {
     const page = await browser.newPage();
     await login(page);
+
+    // Scrape already-booked lessons so we don't try to re-book them
+    const bookedDates = await scrapeBookedLessons(page);
+
     await navigateToSchedule(page);
 
     const allSlots = await scrapeAllSlots(page);
 
     const slotsToBook = allSlots
       .map((slot) => ({ slot, ...isEligible(slot) }))
-      .filter((s) => s.eligible);
+      .filter((s) => s.eligible)
+      .filter((s) => !bookedDates.has(s.slot.dateText));
 
+    const alreadyBookedCount = allSlots.filter(s => isEligible(s).eligible && bookedDates.has(s.dateText)).length;
     const blackoutCount = allSlots.filter(s => isBlackedOut(s)).length;
-    const skippedCount = allSlots.length - slotsToBook.length - blackoutCount;
+    const skippedCount = allSlots.length - slotsToBook.length - blackoutCount - alreadyBookedCount;
 
     // Build concise scan summary for log channel
     const months = [...new Set(allSlots.map(s => parseSlotDate(s.dateText)?.month).filter(Boolean))].sort();
@@ -689,7 +763,7 @@ async function openBrowserAndScan(): Promise<boolean> {
       `📋 **Scan Complete** — ${new Date().toLocaleString("en-US")}`,
       ``,
       `**Months:** ${monthNames.join(", ") || "none"}`,
-      `**Total:** ${allSlots.length} | **Eligible:** ${slotsToBook.length} | **Blacked out:** ${blackoutCount} | **Skipped:** ${skippedCount}`,
+      `**Total:** ${allSlots.length} | **Eligible:** ${slotsToBook.length} | **Already booked:** ${alreadyBookedCount} | **Blacked out:** ${blackoutCount} | **Skipped:** ${skippedCount}`,
       ``,
       slotsToBook.length > 0
         ? `**Eligible slots:**\n${eligibleSlotLines}`
@@ -702,15 +776,17 @@ async function openBrowserAndScan(): Promise<boolean> {
     const allSlotLines = allSlots
       .map((slot) => {
         const { eligible, pickup } = isEligible(slot);
-        const tag = isBlackedOut(slot) ? "🚫" : eligible ? "✅" : "⏭️";
-        return `${tag} ${slot.dateText} | ${slot.instructor}${eligible ? ` | ${pickup}` : ""}`;
+        const alreadyBooked = eligible && bookedDates.has(slot.dateText);
+        const tag = isBlackedOut(slot) ? "🚫" : alreadyBooked ? "📌" : eligible ? "✅" : "⏭️";
+        const suffix = alreadyBooked ? " | already booked" : eligible ? ` | ${pickup}` : "";
+        return `${tag} ${slot.dateText} | ${slot.instructor}${suffix}`;
       })
       .join("\n");
 
     await notifyScan(
       `📋 **Scan Complete** — ${new Date().toLocaleString("en-US")}\n` +
       `**${allSlots.length}** slots across **${monthNames.join(", ") || "no months"}** | ` +
-      `${slotsToBook.length} eligible | ${blackoutCount} blacked out | ${skippedCount} skipped\n\n` +
+      `${slotsToBook.length} eligible | ${alreadyBookedCount} already booked | ${blackoutCount} blacked out | ${skippedCount} skipped\n\n` +
       allSlotLines
     );
 
@@ -734,6 +810,7 @@ async function openBrowserAndScan(): Promise<boolean> {
       const success = await bookSlot(page, slot, pickup);
       if (success) {
         anyBooked = true;
+        bookedDates.add(slot.dateText);
         log("Lesson booked successfully!");
         await notifyAlert(
           `✅ **Driving Lesson Booked!**\n\n` +
