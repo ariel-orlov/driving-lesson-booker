@@ -663,54 +663,104 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     return Object.entries(byMonth).map(([m, c]) => `${m}:${c}`).join(" ");
   }
 
-  // Helper: scrape all pages in the current table view (simple page-by-page).
+  // Helper: scrape all pages by fetching each page's HTML directly via HTTP.
+  // This bypasses all DOM click/navigation issues — just direct HTTP requests.
   async function scrapeAllPages(label: string, monthOff: number): Promise<number> {
     let totalNew = 0;
 
-    // Concise diagnostic line
-    const diag = await page.evaluate(() => {
-      const url = window.location.href;
-      const rows = document.querySelectorAll("table tbody tr").length;
-      const jq = typeof (window as any).jQuery !== "undefined";
-      return { url, rows, jq };
-    });
-    const maxPage = await getMaxPage(page);
-    log(`${label}: url=${diag.url} rows=${diag.rows} maxPage=${maxPage} jQuery=${diag.jq ? "yes" : "no"}`);
-
-    // Log page link details for diagnostics
-    const linkInfo = await page.evaluate(() => {
-      const links = document.querySelectorAll("a");
-      const found: string[] = [];
-      for (const link of links) {
-        const text = link.textContent?.trim() || "";
-        const href = link.getAttribute("href") || "";
-        if (/^\d+$/.test(text) && (href.includes("page=") || link.href.includes("page="))) {
-          found.push(`"${text}" href="${href.substring(0, 80)}"`);
-        }
-      }
-      return found;
-    });
-    log(`${label}: ${linkInfo.length} page links: ${linkInfo.join(", ") || "none"}`);
-
-    // Scrape page 1
+    // Scrape page 1 from the already-loaded DOM
     const page1Slots = await scrapeCurrentPage(page, 1, monthOff);
     totalNew += addSlots(page1Slots);
     log(`${label}: pg 1 -> ${page1Slots.length} slots [${monthSummary(page1Slots)}]`);
 
-    // Scrape pages 2+
-    const pageLimit = Math.min(maxPage, MAX_PAGES);
+    // Get the base URL and max page from pagination links
+    const pageInfo = await page.evaluate(() => {
+      const links = document.querySelectorAll("a");
+      let maxPage = 1;
+      let baseUrl = "";
+      const linkDetails: string[] = [];
+
+      for (const link of links) {
+        const text = link.textContent?.trim() || "";
+        const href = link.getAttribute("href") || "";
+        const fullHref = link.href || "";
+        if (/^\d+$/.test(text) && (href.includes("page=") || fullHref.includes("page="))) {
+          const num = parseInt(text, 10);
+          if (num > maxPage) maxPage = num;
+          // Extract the base URL (everything before page=N)
+          if (!baseUrl && fullHref) {
+            baseUrl = fullHref.replace(/([?&])page=\d+/, "$1page=__PAGE__");
+          }
+          linkDetails.push(`"${text}" href="${href}" data-ajax="${link.getAttribute("data-ajax")}" data-ajax-update="${link.getAttribute("data-ajax-update")}"`);
+        }
+      }
+      return { maxPage, baseUrl, linkDetails };
+    });
+
+    log(`${label}: maxPage=${pageInfo.maxPage} baseUrl=${pageInfo.baseUrl || "none"}`);
+    log(`${label}: links: ${pageInfo.linkDetails.join(", ") || "none"}`);
+
+    if (!pageInfo.baseUrl || pageInfo.maxPage <= 1) {
+      log(`${label} done (single page): ${totalNew} new, ${allSlots.length} unique overall`);
+      return totalNew;
+    }
+
+    // Fetch pages 2+ directly via HTTP — no clicking needed
+    const pageLimit = Math.min(pageInfo.maxPage, MAX_PAGES);
     for (let p = 2; p <= pageLimit; p++) {
       try {
-        const navigated = await goToPage(page, p);
-        if (!navigated) break;
+        const fetchUrl = pageInfo.baseUrl.replace("__PAGE__", String(p));
 
-        const pageSlots = await scrapeCurrentPage(page, p, monthOff);
+        // Fetch the page HTML directly from the server
+        const fetchResult = await page.evaluate(async (url) => {
+          try {
+            const resp = await fetch(url, {
+              headers: {
+                "X-Requested-With": "XMLHttpRequest",
+                "Accept": "text/html, */*; q=0.01",
+              },
+              credentials: "same-origin",
+            });
+            if (!resp.ok) return { error: `HTTP ${resp.status}`, html: "" };
+            const html = await resp.text();
+            return { error: null, html };
+          } catch (err) {
+            return { error: String(err), html: "" };
+          }
+        }, fetchUrl);
+
+        if (fetchResult.error) {
+          log(`${label}: pg ${p} fetch error: ${fetchResult.error}`);
+          continue; // try next page, don't break
+        }
+
+        // Parse slots from the HTML response
+        const pageSlots = await page.evaluate((html, pn, mo) => {
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(html, "text/html");
+          const rows = doc.querySelectorAll("table tbody tr");
+          const slots: { dateText: string; instructor: string; rowIndex: number; page: number; monthOffset: number }[] = [];
+
+          rows.forEach((row, idx) => {
+            const cells = row.querySelectorAll("td");
+            if (cells.length >= 2) {
+              const dateText = cells[0]?.textContent?.trim() ?? "";
+              const instructor = cells[1]?.textContent?.trim() ?? "";
+              if (dateText && /^\w{3},\s+\w{3}\s+\d/.test(dateText)) {
+                slots.push({ dateText, instructor, rowIndex: idx, page: pn, monthOffset: mo });
+              }
+            }
+          });
+
+          return slots;
+        }, fetchResult.html, p, monthOff);
+
         const nc = addSlots(pageSlots);
         totalNew += nc;
         log(`${label}: pg ${p} -> ${pageSlots.length} slots (${nc} new) [${monthSummary(pageSlots)}]`);
       } catch (err) {
         log(`${label}: pg ${p} error: ${err}`);
-        break;
+        continue; // try next page
       }
     }
 
@@ -818,38 +868,98 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
       }
     }
 
-    // Find and click the slot link — may need to navigate through pages
+    // Find and click the slot link — check page 1 first, then fetch other pages
     let slotClicked = false;
-    const maxPage = await getMaxPage(page);
-    const pagesToTry = slot.page > 1 ? [slot.page, ...Array.from({ length: maxPage }, (_, i) => i + 1).filter(p => p !== slot.page)] : [1, ...Array.from({ length: maxPage - 1 }, (_, i) => i + 2)];
 
-    for (const p of pagesToTry) {
-      if (p > 1) {
-        const reached = await goToPage(page, p);
-        if (!reached) continue;
+    // Try page 1 (already loaded in DOM)
+    slotClicked = await page.evaluate((targetDate) => {
+      const rows = document.querySelectorAll("table tbody tr");
+      for (const row of rows) {
+        const firstCell = row.querySelector("td:first-child a");
+        if (firstCell && firstCell.textContent?.trim() === targetDate) {
+          (firstCell as HTMLElement).click();
+          return true;
+        }
       }
-      await sleep(1000);
+      return false;
+    }, slot.dateText);
 
-      slotClicked = await page.evaluate((targetDate) => {
-        const rows = document.querySelectorAll("table tbody tr");
-        for (const row of rows) {
-          const firstCell = row.querySelector("td:first-child a");
-          if (firstCell && firstCell.textContent?.trim() === targetDate) {
-            (firstCell as HTMLElement).click();
-            return true;
+    if (slotClicked) {
+      log(`Found slot on page 1: ${slot.dateText}`);
+    }
+
+    // If not on page 1, get pagination base URL and fetch other pages
+    if (!slotClicked) {
+      const bookPageInfo = await page.evaluate(() => {
+        const links = document.querySelectorAll("a");
+        let maxPage = 1;
+        let baseUrl = "";
+        for (const link of links) {
+          const text = link.textContent?.trim() || "";
+          const fullHref = link.href || "";
+          if (/^\d+$/.test(text) && fullHref.includes("page=")) {
+            const num = parseInt(text, 10);
+            if (num > maxPage) maxPage = num;
+            if (!baseUrl) baseUrl = fullHref.replace(/([?&])page=\d+/, "$1page=__PAGE__");
           }
         }
-        return false;
-      }, slot.dateText);
+        // Also find the data-ajax-update target container
+        const ajaxLink = document.querySelector("a[data-ajax-update]");
+        const updateTarget = ajaxLink?.getAttribute("data-ajax-update") || null;
+        return { maxPage, baseUrl, updateTarget };
+      });
 
-      if (slotClicked) {
-        log(`Found slot on page ${p}: ${slot.dateText}`);
-        break;
+      if (bookPageInfo.baseUrl) {
+        const pagesToTry = slot.page > 1
+          ? [slot.page, ...Array.from({ length: bookPageInfo.maxPage }, (_, i) => i + 1).filter(p => p !== slot.page)]
+          : Array.from({ length: bookPageInfo.maxPage - 1 }, (_, i) => i + 2);
+
+        for (const p of pagesToTry) {
+          // Fetch page HTML and inject into DOM so we can click the slot link
+          const injected = await page.evaluate(async (url, target) => {
+            try {
+              const resp = await fetch(url, {
+                headers: { "X-Requested-With": "XMLHttpRequest", "Accept": "text/html, */*; q=0.01" },
+                credentials: "same-origin",
+              });
+              if (!resp.ok) return false;
+              const html = await resp.text();
+              const containers = target ? [target] : [".table-responsive", "#scheduleContent", "#content"];
+              for (const sel of containers) {
+                const el = document.querySelector(sel);
+                if (el) { el.innerHTML = html; return true; }
+              }
+              const table = document.querySelector("table");
+              if (table?.parentElement) { table.parentElement.innerHTML = html; return true; }
+              return false;
+            } catch { return false; }
+          }, bookPageInfo.baseUrl.replace("__PAGE__", String(p)), bookPageInfo.updateTarget);
+
+          if (!injected) continue;
+          await sleep(500);
+
+          slotClicked = await page.evaluate((targetDate) => {
+            const rows = document.querySelectorAll("table tbody tr");
+            for (const row of rows) {
+              const firstCell = row.querySelector("td:first-child a");
+              if (firstCell && firstCell.textContent?.trim() === targetDate) {
+                (firstCell as HTMLElement).click();
+                return true;
+              }
+            }
+            return false;
+          }, slot.dateText);
+
+          if (slotClicked) {
+            log(`Found slot on page ${p}: ${slot.dateText}`);
+            break;
+          }
+        }
       }
     }
 
     if (!slotClicked) {
-      log(`Could not find slot link for: ${slot.dateText} (searched ${pagesToTry.length} pages)`);
+      log(`Could not find slot link for: ${slot.dateText}`);
       return false;
     }
 
