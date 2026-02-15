@@ -588,21 +588,50 @@ async function openBrowserAndScan(): Promise<void> {
       .map((slot) => ({ slot, ...isEligible(slot) }))
       .filter((s) => s.eligible);
 
-    // Concise Discord log: just counts + eligible list
-    const eligibleLines = slotsToBook
-      .map(({ slot, pickup }) => `• ${slot.dateText} | ${slot.instructor} | ${pickup}`)
-      .join("\n");
+    const blackoutCount = allSlots.filter(s => isBlackedOut(s)).length;
+    const skippedCount = allSlots.length - slotsToBook.length - blackoutCount;
 
-    await notifyLog(
-      `📋 **Scan** — ${new Date().toLocaleString("en-US")}\n` +
-      `${allSlots.length} total | ${slotsToBook.length} eligible` +
-      (slotsToBook.length > 0 ? `\n${eligibleLines}` : "")
-    );
+    // Detailed breakdown for each slot
+    const allSlotLines = allSlots.map(s => {
+      const { eligible, pickup } = isEligible(s);
+      const bo = isBlackedOut(s);
+      const tag = bo ? "🚫 BLACKOUT" : eligible ? `✅ ELIGIBLE (${pickup})` : "⏭️ skip";
+      return `${tag} — ${s.dateText} | ${s.instructor}`;
+    });
+
+    // Build full scan message for log channel
+    const months = [...new Set(allSlots.map(s => parseSlotDate(s.dateText)?.month).filter(Boolean))].sort();
+    const monthNames = months.map(m => Object.entries(MONTH_MAP).find(([, v]) => v === m)?.[0] ?? "?");
+
+    const scanMsg = [
+      `📋 **Scan Complete** — ${new Date().toLocaleString("en-US")}`,
+      ``,
+      `**Months scanned:** ${monthNames.join(", ") || "none"}`,
+      `**Total slots:** ${allSlots.length}`,
+      `**Eligible:** ${slotsToBook.length}`,
+      `**Blacked out:** ${blackoutCount}`,
+      `**Skipped (wrong time):** ${skippedCount}`,
+      ``,
+      `**All slots:**`,
+      ...allSlotLines,
+    ].join("\n");
+
+    await notifyLog(scanMsg);
 
     if (slotsToBook.length === 0) {
       log("No eligible slots right now. Will keep checking...");
       return;
     }
+
+    // Alert on important channel when eligible slots are found
+    const eligibleLines = slotsToBook
+      .map(({ slot, pickup }) => `• ${slot.dateText} | ${slot.instructor} | pickup: ${pickup}`)
+      .join("\n");
+
+    await notifyAlert(
+      `🔔 **${slotsToBook.length} Eligible Slot${slotsToBook.length > 1 ? "s" : ""} Found!**\n` +
+      `Attempting to book...\n\n${eligibleLines}`
+    );
 
     for (const { slot, pickup } of slotsToBook) {
       const success = await bookSlot(page, slot, pickup);
@@ -614,6 +643,13 @@ async function openBrowserAndScan(): Promise<void> {
           `👤 Instructor: ${slot.instructor}\n` +
           `📍 Pickup: ${pickup}\n` +
           `🕐 ${new Date().toLocaleString("en-US")}`
+        );
+      } else {
+        await notifyAlert(
+          `⚠️ **Booking Failed**\n` +
+          `📅 ${slot.dateText}\n` +
+          `👤 ${slot.instructor}\n` +
+          `Slot may have been taken.`
         );
       }
     }
