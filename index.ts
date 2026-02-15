@@ -255,50 +255,54 @@ async function getMaxPage(page: Page): Promise<number> {
 }
 
 async function goToPage(page: Page, targetPage: number): Promise<boolean> {
-  // Tag the specific page number link so we can find it with an ElementHandle
-  const found = await page.evaluate((target) => {
-    document.querySelectorAll("[data-nav-target]").forEach(el => el.removeAttribute("data-nav-target"));
+  // Strategy 1: DataTables API — directly switch page without any click events
+  const dtResult = await page.evaluate((target) => {
+    try {
+      const jq = (window as any).jQuery;
+      if (!jq) return null;
+      const dt = jq("table").DataTable();
+      dt.page(target - 1).draw(false);
+      return "datatables";
+    } catch {
+      return null;
+    }
+  }, targetPage);
+
+  if (dtResult) {
+    log(`Switched to page ${targetPage} via DataTables API`);
+    await sleep(500);
+    return true;
+  }
+
+  // Strategy 2: jQuery .trigger('click') on pagination link
+  const result = await page.evaluate((target) => {
     const links = document.querySelectorAll("a");
     for (const link of links) {
       const text = link.textContent?.trim();
       const href = link.href || "";
       if (text === String(target) && href.includes("page=")) {
-        link.setAttribute("data-nav-target", "true");
-        return true;
+        if (typeof (window as any).jQuery !== "undefined") {
+          (window as any).jQuery(link).trigger("click");
+          return "jquery";
+        }
+        link.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true, view: window }));
+        return "mouseevent";
       }
     }
-    return false;
+    return null;
   }, targetPage);
 
-  if (!found) {
+  if (!result) {
     log(`No page link found for page ${targetPage}`);
     return false;
   }
 
-  const diagInfo = await page.evaluate(() => {
-    const el = document.querySelector('[data-nav-target="true"]');
-    if (!el) return "element not found";
-    const rect = el.getBoundingClientRect();
-    return `tag=${el.tagName} text="${el.textContent?.trim()}" href="${(el as HTMLAnchorElement).href}" visible=${rect.width > 0 && rect.height > 0} rect=[${Math.round(rect.x)},${Math.round(rect.y)},${Math.round(rect.width)},${Math.round(rect.height)}]`;
-  });
-  log(`[diag] Page link: ${diagInfo}`);
+  log(`Clicked page ${targetPage} via ${result}`);
 
-  // Use ElementHandle to avoid "not clickable" errors when the link is
-  // below the viewport. ElementHandle.click() auto-scrolls into view and
-  // fires real mouse events (unlike evaluate(() => el.click()) which only
-  // fires synthetic events that don't trigger jQuery/AJAX handlers).
-  const element = await page.$('[data-nav-target="true"]');
-  if (!element) {
-    log(`Could not get ElementHandle for page ${targetPage}`);
-    return false;
-  }
-
-  await page.evaluate(el => el.scrollIntoView({ block: "center", inline: "center" }), element);
-
-  // Promise.all ensures navigation listener is set up BEFORE the click.
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15_000 }).catch(() => {}),
-    element.click(),
+  // Wait for content update
+  await Promise.race([
+    page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10_000 }).catch(() => {}),
+    sleep(3000),
   ]);
   await sleep(1000);
   return true;
@@ -403,6 +407,60 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   // Helper: scrape all pages in the current table view
   async function scrapeAllPages(label: string, monthOff: number): Promise<number> {
     let totalNew = 0;
+
+    // Strategy 1: Use DataTables API to extract ALL rows across all pages in one shot
+    const dtResult = await page.evaluate((mo) => {
+      try {
+        const jq = (window as any).jQuery;
+        if (!jq) return { method: "no-jquery" as const };
+
+        let dt: any;
+        try {
+          dt = jq("table").DataTable();
+        } catch {
+          return { method: "not-datatables" as const };
+        }
+
+        const info = dt.page.info();
+        if (!info || info.pages <= 0) return { method: "no-pages" as const };
+
+        const allRows: { dateText: string; instructor: string; rowIndex: number; page: number; monthOffset: number }[] = [];
+        const origPage = info.page;
+
+        for (let p = 0; p < info.pages; p++) {
+          dt.page(p).draw(false);
+          const rows = document.querySelectorAll("table tbody tr");
+          rows.forEach((row, idx) => {
+            const cells = row.querySelectorAll("td");
+            if (cells.length >= 2) {
+              const dateText = cells[0]?.textContent?.trim() ?? "";
+              const instructor = cells[1]?.textContent?.trim() ?? "";
+              if (dateText && /^\w{3},\s+\w{3}\s+\d/.test(dateText)) {
+                allRows.push({ dateText, instructor, rowIndex: idx, page: p + 1, monthOffset: mo });
+              }
+            }
+          });
+        }
+
+        // Restore original page
+        dt.page(origPage).draw(false);
+
+        return { method: "datatables" as const, rows: allRows, pages: info.pages, recordsTotal: info.recordsTotal };
+      } catch (e: any) {
+        return { method: "dt-error" as const, error: e?.message ?? String(e) };
+      }
+    }, monthOff);
+
+    if (dtResult.method === "datatables" && "rows" in dtResult && dtResult.rows.length > 0) {
+      totalNew = addSlots(dtResult.rows);
+      log(`${label}: DataTables API → ${dtResult.rows.length} rows across ${dtResult.pages} pages, ${totalNew} new [${monthSummary(dtResult.rows)}]`);
+      log(`${label} done: ${totalNew} new, ${allSlots.length} unique overall`);
+      return totalNew;
+    }
+
+    log(`${label}: DataTables unavailable (${dtResult.method}${"error" in dtResult ? `: ${dtResult.error}` : ""}), using pagination fallback`);
+
+    // Strategy 2: Fall back to page-by-page scraping with goToPage
     const page1Slots = await scrapeCurrentPage(page, 1, monthOff);
     totalNew += addSlots(page1Slots);
 
@@ -435,31 +493,37 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   // 2) Try advancing the calendar to find slots in additional months
   for (let m = 0; m < MAX_MONTHS_AHEAD; m++) {
     const calendarOffset = m + 1;
-    await navigateToSchedule(page);
+    try {
+      await navigateToSchedule(page);
 
-    // Advance the datepicker calendarOffset times WITHOUT clicking any dates
-    let advanced = true;
-    for (let i = 0; i < calendarOffset; i++) {
-      if (!await advanceDatepicker(page)) {
-        advanced = false;
+      // Advance the datepicker calendarOffset times WITHOUT clicking any dates
+      let advanced = true;
+      for (let i = 0; i < calendarOffset; i++) {
+        if (!await advanceDatepicker(page)) {
+          advanced = false;
+          break;
+        }
+      }
+      if (!advanced) {
+        log(`Calendar: no more months after +${m}.`);
         break;
       }
-    }
-    if (!advanced) {
-      log(`Calendar: no more months after +${m}.`);
-      break;
-    }
 
-    // NOW click a date to load the target month's slots
-    if (!await clickDateInDatepicker(page)) {
-      log(`Calendar +${calendarOffset}: could not click date in datepicker.`);
-      break;
-    }
+      // NOW click a date to load the target month's slots
+      if (!await clickDateInDatepicker(page)) {
+        log(`Calendar +${calendarOffset}: could not click date in datepicker.`);
+        break;
+      }
 
-    const newFound = await scrapeAllPages(`Calendar +${calendarOffset}`, calendarOffset);
-    if (newFound === 0) {
-      log(`No new slots after calendar +${calendarOffset}. Done.`);
-      break;
+      const newFound = await scrapeAllPages(`Calendar +${calendarOffset}`, calendarOffset);
+      if (newFound === 0) {
+        log(`No new slots after calendar +${calendarOffset}. Done.`);
+        break;
+      }
+    } catch (err) {
+      log(`Calendar +${calendarOffset} error (frame may have detached): ${err}`);
+      // Continue to next iteration — navigateToSchedule will reset the page
+      continue;
     }
   }
 
@@ -680,11 +744,20 @@ async function openBrowserAndScan(): Promise<void> {
 
     await notifyLog(scanMsg);
 
-    // Scan completion ping — confirms every full scan cycle
+    // Scan completion — full list of every slot found
+    const allSlotLines = allSlots
+      .map((slot) => {
+        const { eligible, pickup } = isEligible(slot);
+        const tag = isBlackedOut(slot) ? "🚫" : eligible ? "✅" : "⏭️";
+        return `${tag} ${slot.dateText} | ${slot.instructor}${eligible ? ` | ${pickup}` : ""}`;
+      })
+      .join("\n");
+
     await notifyScan(
-      `✅ Scan complete — ${new Date().toLocaleString("en-US")}\n` +
-      `Checked **${allSlots.length}** slots across **${monthNames.join(", ") || "no months"}**\n` +
-      `${slotsToBook.length} eligible | ${blackoutCount} blacked out | ${skippedCount} skipped`
+      `📋 **Scan Complete** — ${new Date().toLocaleString("en-US")}\n` +
+      `**${allSlots.length}** slots across **${monthNames.join(", ") || "no months"}** | ` +
+      `${slotsToBook.length} eligible | ${blackoutCount} blacked out | ${skippedCount} skipped\n\n` +
+      allSlotLines
     );
 
     if (slotsToBook.length === 0) {
