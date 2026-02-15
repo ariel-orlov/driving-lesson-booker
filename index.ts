@@ -236,19 +236,38 @@ async function getPageLinks(page: Page): Promise<{ maxPage: number; nextUrl: str
 }
 
 async function goToPage(page: Page, targetPage: number): Promise<boolean> {
-  const { pageUrls } = await getPageLinks(page);
-  const url = pageUrls[targetPage];
-  if (!url) {
-    log(`No URL found for page ${targetPage}`);
+  // Tag the specific page number link so we can click it with Puppeteer's native click
+  const found = await page.evaluate((target) => {
+    document.querySelectorAll("[data-nav-target]").forEach(el => el.removeAttribute("data-nav-target"));
+    const links = document.querySelectorAll("a");
+    for (const link of links) {
+      const text = link.textContent?.trim();
+      const href = link.href || "";
+      if (text === String(target) && href.includes("page=")) {
+        link.setAttribute("data-nav-target", "true");
+        return true;
+      }
+    }
+    return false;
+  }, targetPage);
+
+  if (!found) {
+    log(`No page link found for page ${targetPage}`);
     return false;
   }
-  await page.goto(url, { waitUntil: "networkidle2", timeout: 15_000 });
-  await sleep(500);
+
+  // Puppeteer's native click fires real mouse events (mousedown/mouseup/click)
+  // unlike evaluate(() => el.click()) which only fires a synthetic click event.
+  // Promise.all ensures navigation listener is set up BEFORE the click.
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15_000 }).catch(() => {}),
+    page.click('[data-nav-target="true"]'),
+  ]);
+  await sleep(1000);
   return true;
 }
 
 async function clickToPage(page: Page, targetPage: number): Promise<boolean> {
-  // Navigate directly to the target page URL
   return goToPage(page, targetPage);
 }
 
@@ -347,19 +366,14 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     const page1Slots = await scrapeCurrentPage(page, 1, 0);
     totalNew += addSlots(page1Slots);
 
-    const { maxPage, pageUrls } = await getPageLinks(page);
+    const { maxPage } = await getPageLinks(page);
     const pageLimit = Math.min(maxPage, MAX_PAGES);
     log(`${label}: pg 1 → ${page1Slots.length} slots [${monthSummary(page1Slots)}], ${pageLimit} pages`);
 
     for (let p = 2; p <= pageLimit; p++) {
       try {
-        const url = pageUrls[p];
-        if (!url) {
-          log(`  pg ${p}: no URL found, stopping`);
-          break;
-        }
-        await page.goto(url, { waitUntil: "networkidle2", timeout: 15_000 });
-        await sleep(500);
+        const navigated = await goToPage(page, p);
+        if (!navigated) break;
 
         const pageSlots = await scrapeCurrentPage(page, p, 0);
         const nc = addSlots(pageSlots);
