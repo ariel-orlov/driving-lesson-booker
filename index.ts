@@ -346,6 +346,17 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     return newCount;
   }
 
+  // Summarize which months appear in a set of slots
+  function monthSummary(slots: Slot[]): string {
+    const byMonth: Record<string, number> = {};
+    for (const s of slots) {
+      const parsed = parseSlotDate(s.dateText);
+      const name = parsed ? (Object.entries(MONTH_MAP).find(([, v]) => v === parsed.month)?.[0] ?? "?") : "?";
+      byMonth[name] = (byMonth[name] || 0) + 1;
+    }
+    return Object.entries(byMonth).map(([m, c]) => `${m}:${c}`).join(" ");
+  }
+
   // Helper: scrape all pages in the current table view
   async function scrapeAllPages(label: string): Promise<number> {
     let totalNew = 0;
@@ -354,7 +365,7 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
 
     const { maxPage } = await getPageLinks(page);
     const pageLimit = Math.min(maxPage, MAX_PAGES);
-    log(`${label}: ${page1Slots.length} slots on pg 1, ${pageLimit} pages`);
+    log(`${label}: pg 1 → ${page1Slots.length} slots [${monthSummary(page1Slots)}], ${pageLimit} pages total`);
 
     for (let p = 2; p <= pageLimit; p++) {
       try {
@@ -364,7 +375,7 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
         const pageSlots = await scrapeCurrentPage(page, p, 0);
         const nc = addSlots(pageSlots);
         totalNew += nc;
-        log(`  pg ${p}: ${pageSlots.length} slots (${nc} new)`);
+        log(`  pg ${p}: ${pageSlots.length} slots (${nc} new) [${monthSummary(pageSlots)}]`);
         if (nc === 0) break; // all duplicates = likely cycling
       } catch (err) {
         log(`  pg ${p} error: ${err}`);
@@ -372,7 +383,7 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
       }
     }
 
-    log(`${label} total: ${totalNew} new, ${allSlots.length} unique`);
+    log(`${label} done: ${totalNew} new, ${allSlots.length} unique overall`);
     return totalNew;
   }
 
