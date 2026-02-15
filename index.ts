@@ -1,18 +1,15 @@
 import puppeteer, { type Page } from "puppeteer";
 import http from "http";
-import fs from "fs";
 
 // ── Config ──────────────────────────────────────────────────────────────────
 const LOGIN_URL =
   "https://www.tds.ms/CentralizeSP/Student/Login/chelmsfordautoschool";
-const SCHEDULE_URL =
-  "https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=1";
 
 const USERNAME = process.env.TDS_USERNAME!;
 const PASSWORD = process.env.TDS_PASSWORD!;
 
 const POLL_INTERVAL_MS = 3 * 60_000;
-const MAX_PAGES = 20;
+const MAX_PAGES = 10; // safety cap; actual page count detected dynamically
 const MAX_MONTHS_AHEAD = 4;
 
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
@@ -117,20 +114,14 @@ function sleep(ms: number): Promise<void> {
 // ── Discord notifications ──────────────────────────────────────────────────
 
 async function sendDiscord(webhookUrl: string, message: string): Promise<void> {
-  if (!webhookUrl) {
-    log("Discord webhook not configured");
-    return;
-  }
+  if (!webhookUrl) return;
   try {
-    const tmpFile = `/tmp/discord_${Date.now()}.json`;
     const truncated = message.length > 1900 ? message.substring(0, 1900) + "\n..." : message;
-    fs.writeFileSync(tmpFile, JSON.stringify({ content: truncated }));
     const resp = await fetch(webhookUrl, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: fs.readFileSync(tmpFile, "utf-8"),
+      body: JSON.stringify({ content: truncated }),
     });
-    fs.unlinkSync(tmpFile);
     if (!resp.ok && resp.status !== 204) {
       log(`Discord send failed: ${resp.status}`);
     }
@@ -172,7 +163,7 @@ async function login(page: Page): Promise<void> {
 }
 
 async function navigateToSchedule(page: Page): Promise<void> {
-  log("Navigating to Schedule My Drive...");
+  // Navigate to schedule page
   await page.goto("https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1", {
     waitUntil: "networkidle2",
     timeout: 30_000,
@@ -192,7 +183,7 @@ async function navigateToSchedule(page: Page): Promise<void> {
     log("No slots table found (may be empty).");
   });
 
-  await sleep(2000);
+  await sleep(1000);
 }
 
 async function scrapeCurrentPage(page: Page, pageNum: number, monthOff: number = 0): Promise<Slot[]> {
@@ -215,39 +206,57 @@ async function scrapeCurrentPage(page: Page, pageNum: number, monthOff: number =
   }, pageNum, monthOff);
 }
 
-async function clickNextPageLink(page: Page): Promise<boolean> {
-  // Check if a ">" pagination link exists with a real URL (not datepicker)
-  const hasNext = await page.evaluate(() => {
+async function getPageLinks(page: Page): Promise<{ maxPage: number; nextUrl: string | null; pageUrls: Record<number, string> }> {
+  return page.evaluate(() => {
+    let maxPage = 1;
+    let nextUrl: string | null = null;
+    const pageUrls: Record<number, string> = {};
+
     const links = document.querySelectorAll("a");
     for (const link of links) {
-      const href = link.getAttribute("href") || "";
+      const href = link.href || "";
+      const rawHref = link.getAttribute("href") || "";
       const text = link.textContent?.trim() || "";
-      if (text === ">" && href.includes("page=") && !href.startsWith("javascript:")) {
+      if (!href || rawHref.startsWith("javascript:")) continue;
+
+      const pageMatch = href.match(/[?&]page=(\d+)/);
+      if (pageMatch) {
+        const pageNum = parseInt(pageMatch[1], 10);
+        if (pageNum > maxPage) maxPage = pageNum;
+        pageUrls[pageNum] = href;
+
+        if (text === ">") {
+          nextUrl = href;
+        }
+      }
+    }
+
+    return { maxPage, nextUrl, pageUrls };
+  });
+}
+
+async function clickNextPageLink(page: Page): Promise<boolean> {
+  const clicked = await page.evaluate(() => {
+    const links = document.querySelectorAll("a");
+    for (const link of links) {
+      const text = link.textContent?.trim() || "";
+      const href = link.getAttribute("href") || "";
+      if (text === ">" && href.includes("page=")) {
+        (link as HTMLElement).click();
         return true;
       }
     }
     return false;
   });
 
-  if (!hasNext) return false;
-
-  // Click it with navigation wait
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15_000 }),
-    page.evaluate(() => {
-      const links = document.querySelectorAll("a");
-      for (const link of links) {
-        const href = link.getAttribute("href") || "";
-        const text = link.textContent?.trim() || "";
-        if (text === ">" && href.includes("page=") && !href.startsWith("javascript:")) {
-          (link as HTMLElement).click();
-          return;
-        }
-      }
-    }),
-  ]);
-
-  return true;
+  if (clicked) {
+    await Promise.race([
+      page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10_000 }).catch(() => {}),
+      sleep(5000),
+    ]);
+    await sleep(500);
+  }
+  return clicked;
 }
 
 async function clickToPage(page: Page, targetPage: number): Promise<boolean> {
@@ -261,57 +270,60 @@ async function clickToPage(page: Page, targetPage: number): Promise<boolean> {
 
 async function clickNextMonth(page: Page): Promise<boolean> {
   const clicked = await page.evaluate(() => {
-    // Look for datepicker ">" that is NOT a pagination link (no "page=" in href)
-    const links = document.querySelectorAll("a");
-    for (const link of links) {
-      const href = link.getAttribute("href") || "";
-      const text = link.textContent?.trim() || "";
-      if (text === ">" && !href.includes("page=")) {
-        (link as HTMLElement).click();
-        return "datepicker-arrow";
+    // Try jQuery UI datepicker next button first (most reliable)
+    const selectors = [
+      ".ui-datepicker-next:not(.ui-state-disabled)",
+      "[data-handler='next']",
+      ".datepicker-next",
+    ];
+    for (const sel of selectors) {
+      const el = document.querySelector(sel) as HTMLElement | null;
+      if (el) {
+        el.click();
+        return `selector: ${sel}`;
       }
     }
-    // jQuery UI datepicker next button
-    const uiNext = document.querySelector(
-      ".ui-datepicker-next:not(.ui-state-disabled)"
-    ) as HTMLElement | null;
-    if (uiNext) {
-      uiNext.click();
-      return "ui-datepicker";
+
+    // Fallback: ">" link that is NOT a pagination link (no "page=" in href)
+    const els = document.querySelectorAll("a, span, button");
+    for (const el of els) {
+      const text = el.textContent?.trim() || "";
+      const href = (el as HTMLAnchorElement).getAttribute?.("href") || "";
+      if ((text === ">" || text === "›" || text === "»") && !href.includes("page=")) {
+        (el as HTMLElement).click();
+        return `text: "${text}"`;
+      }
     }
     return null;
   });
 
   if (!clicked) return false;
-  log(`Advanced to next month via ${clicked}`);
+  log(`Advanced calendar via ${clicked}`);
   await sleep(2000);
 
-  // Click the first available date in the datepicker to load that month's slots
+  // Click the last available date in the datepicker (likely the newest month)
   const dateClicked = await page.evaluate(() => {
-    const cell = document.querySelector(
+    const cells = document.querySelectorAll(
       ".ui-datepicker td:not(.ui-state-disabled) a, .datepicker td:not(.disabled) a"
-    ) as HTMLElement | null;
-    if (cell) {
-      cell.click();
+    );
+    if (cells.length > 0) {
+      (cells[cells.length - 1] as HTMLElement).click();
       return true;
     }
     return false;
   });
 
   if (dateClicked) {
-    log("Clicked date cell in datepicker, waiting for table to update...");
-    // Wait for navigation if the date click triggers a page load
     await Promise.race([
       page.waitForNavigation({ waitUntil: "networkidle2", timeout: 10_000 }).catch(() => {}),
       sleep(5000),
     ]);
   } else {
-    // No date cell found — the month advance itself may have triggered a table update
     await sleep(3000);
   }
 
   await page.waitForSelector("table tbody tr", { timeout: 15_000 }).catch(() => {
-    log("Warning: no slots table found after advancing month.");
+    log("No slots table after advancing month.");
   });
   await sleep(1000);
   return true;
@@ -334,62 +346,70 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     return newCount;
   }
 
-  for (let monthOffset = 0; monthOffset < MAX_MONTHS_AHEAD; monthOffset++) {
-    if (monthOffset > 0) {
-      // Navigate back to schedule so the datepicker is in the DOM
-      await navigateToSchedule(page);
-      let advanced = true;
-      for (let m = 0; m < monthOffset; m++) {
-        if (!await clickNextMonth(page)) {
-          advanced = false;
-          break;
-        }
-      }
-      if (!advanced) {
-        log(`No more months to check after month offset ${monthOffset - 1}.`);
-        break;
-      }
-    }
+  // Helper: scrape all pages in the current table view
+  async function scrapeAllPages(label: string): Promise<number> {
+    let totalNew = 0;
+    const page1Slots = await scrapeCurrentPage(page, 1, 0);
+    totalNew += addSlots(page1Slots);
 
-    const page1Slots = await scrapeCurrentPage(page, 1, monthOffset);
-    if (page1Slots.length === 0 && monthOffset > 0) {
-      log(`No slots found for month offset ${monthOffset}. Done scanning months.`);
-      break;
-    }
-    addSlots(page1Slots);
-    log(`── Month +${monthOffset}, Page 1: ${page1Slots.length} slots ──`);
-    for (const s of page1Slots) {
-      const { eligible } = isEligible(s);
-      const bo = isBlackedOut(s);
-      const tag = bo ? "BLACKOUT" : eligible ? "ELIGIBLE" : "skip";
-      log(`  [${tag}] ${s.dateText} | ${s.instructor}`);
-    }
+    const { maxPage } = await getPageLinks(page);
+    const pageLimit = Math.min(maxPage, MAX_PAGES);
+    log(`${label}: ${page1Slots.length} slots on pg 1, ${pageLimit} pages`);
 
-    // Click through pagination within this month
-    for (let p = 2; p <= MAX_PAGES; p++) {
+    for (let p = 2; p <= pageLimit; p++) {
       try {
         const hasNext = await clickNextPageLink(page);
-        if (!hasNext) {
-          log(`  No more pagination links after page ${p - 1}.`);
-          break;
-        }
-        await sleep(1000);
+        if (!hasNext) break;
 
-        const pageSlots = await scrapeCurrentPage(page, p, monthOffset);
-        const newCount = addSlots(pageSlots);
-        log(`── Month +${monthOffset}, Page ${p}: ${pageSlots.length} slots (${newCount} new, ${allSlots.length} unique total) ──`);
-        for (const s of pageSlots) {
-          const { eligible } = isEligible(s);
-          const bo = isBlackedOut(s);
-          const tag = bo ? "BLACKOUT" : eligible ? "ELIGIBLE" : "skip";
-          log(`  [${tag}] ${s.dateText} | ${s.instructor}`);
-        }
-        if (pageSlots.length === 0) break;
+        const pageSlots = await scrapeCurrentPage(page, p, 0);
+        const nc = addSlots(pageSlots);
+        totalNew += nc;
+        log(`  pg ${p}: ${pageSlots.length} slots (${nc} new)`);
+        if (nc === 0) break; // all duplicates = likely cycling
       } catch (err) {
-        log(`  Page ${p}: failed to load, stopping. Error: ${err}`);
+        log(`  pg ${p} error: ${err}`);
         break;
       }
     }
+
+    log(`${label} total: ${totalNew} new, ${allSlots.length} unique`);
+    return totalNew;
+  }
+
+  // 1) Scrape the default view (should contain all months currently shown)
+  await scrapeAllPages("Default");
+
+  // 2) Try advancing the calendar to find slots in additional months
+  for (let m = 0; m < MAX_MONTHS_AHEAD; m++) {
+    await navigateToSchedule(page);
+    let advanced = true;
+    for (let i = 0; i <= m; i++) {
+      if (!await clickNextMonth(page)) {
+        advanced = false;
+        break;
+      }
+    }
+    if (!advanced) {
+      log(`Calendar: no more months after +${m}.`);
+      break;
+    }
+
+    const newFound = await scrapeAllPages(`Calendar +${m + 1}`);
+    if (newFound === 0) {
+      log(`No new slots after calendar +${m + 1}. Done.`);
+      break;
+    }
+  }
+
+  // Log summary: only eligible/blackout slots
+  const eligible = allSlots.filter(s => isEligible(s).eligible);
+  const blacked = allSlots.filter(s => isBlackedOut(s));
+  const months = [...new Set(allSlots.map(s => parseSlotDate(s.dateText)?.month).filter(Boolean))].sort();
+  const monthNames = months.map(m => Object.entries(MONTH_MAP).find(([, v]) => v === m)?.[0] ?? "?");
+  log(`Scan done: ${allSlots.length} total across ${monthNames.join("/")} | ${eligible.length} eligible | ${blacked.length} blacked out`);
+  for (const s of eligible) {
+    const { pickup } = isEligible(s);
+    log(`  ✓ ${s.dateText} | ${s.instructor} | ${pickup}`);
   }
 
   return allSlots;
@@ -462,52 +482,7 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
       return false;
     }
 
-    log("Clicked slot link, waiting for booking dialog...");
     await sleep(3000);
-
-    // Debug: log what's visible in the dialog
-    const dialogInfo = await page.evaluate(() => {
-      const radios = document.querySelectorAll('input[type="radio"]');
-      const radioInfo: string[] = [];
-      radios.forEach((r) => {
-        const input = r as HTMLInputElement;
-        const label = r.closest("label")?.textContent?.trim()
-          || r.closest("li")?.textContent?.trim()
-          || r.closest("div")?.textContent?.trim()?.substring(0, 50)
-          || "no label";
-        radioInfo.push(`name=${input.name} value=${input.value} checked=${input.checked} label="${label}"`);
-      });
-
-      const selects = document.querySelectorAll("select");
-      const selectInfo: string[] = [];
-      selects.forEach((s) => {
-        const opts = Array.from(s.options).map(o => `${o.value}="${o.text}"`);
-        selectInfo.push(`select#${s.id}: ${opts.join(", ")}`);
-      });
-
-      const buttons = document.querySelectorAll("button, input[type='submit']");
-      const buttonInfo: string[] = [];
-      buttons.forEach((b) => {
-        const text = b.textContent?.trim() || (b as HTMLInputElement).value || "";
-        if (text) buttonInfo.push(text);
-      });
-
-      // Check for modal/dialog
-      const modals = document.querySelectorAll(".modal, [class*='dialog'], [class*='popup'], [role='dialog']");
-
-      return {
-        radios: radioInfo,
-        selects: selectInfo,
-        buttons: buttonInfo,
-        modalCount: modals.length,
-        bodyText: document.body.innerText.substring(document.body.innerText.length - 2000),
-      };
-    });
-
-    log(`Dialog debug - radios: ${JSON.stringify(dialogInfo.radios)}`);
-    log(`Dialog debug - selects: ${JSON.stringify(dialogInfo.selects)}`);
-    log(`Dialog debug - buttons: ${JSON.stringify(dialogInfo.buttons)}`);
-    log(`Dialog debug - modals: ${dialogInfo.modalCount}`);
 
     // Select the pickup location radio button
     const radioSelected = await page.evaluate((pickupType) => {
@@ -539,7 +514,7 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
       return null;
     }, pickup);
 
-    log(`Radio selection: ${radioSelected}`);
+    if (!radioSelected) log("Warning: no radio button found for pickup");
     await sleep(1000);
 
     // Click "Schedule Lesson" button - try multiple selectors
@@ -613,23 +588,16 @@ async function openBrowserAndScan(): Promise<void> {
       .map((slot) => ({ slot, ...isEligible(slot) }))
       .filter((s) => s.eligible);
 
-    const blackoutCount = allSlots.filter(s => isBlackedOut(s)).length;
+    // Concise Discord log: just counts + eligible list
+    const eligibleLines = slotsToBook
+      .map(({ slot, pickup }) => `• ${slot.dateText} | ${slot.instructor} | ${pickup}`)
+      .join("\n");
 
-    // Build scan summary
-    const eligibleList = slotsToBook.length > 0
-      ? slotsToBook.map(({ slot, pickup }) =>
-          `  • ${slot.dateText} | ${slot.instructor} | ${pickup}`
-        ).join("\n")
-      : "  None";
-
-    const scanMsg = [
-      `📋 **Scan Complete** — ${new Date().toLocaleString("en-US")}`,
-      `Total: ${allSlots.length} | Eligible: ${slotsToBook.length} | Blacked out: ${blackoutCount}`,
-      `\nEligible slots:\n${eligibleList}`,
-    ].join("\n");
-
-    await notifyLog(scanMsg);
-    log(`Found ${allSlots.length} total, ${slotsToBook.length} eligible, ${blackoutCount} blacked out.`);
+    await notifyLog(
+      `📋 **Scan** — ${new Date().toLocaleString("en-US")}\n` +
+      `${allSlots.length} total | ${slotsToBook.length} eligible` +
+      (slotsToBook.length > 0 ? `\n${eligibleLines}` : "")
+    );
 
     if (slotsToBook.length === 0) {
       log("No eligible slots right now. Will keep checking...");
