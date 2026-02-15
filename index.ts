@@ -247,7 +247,7 @@ async function getMaxPage(page: Page): Promise<number> {
 }
 
 async function goToPage(page: Page, targetPage: number): Promise<boolean> {
-  // Tag the specific page number link so we can click it with Puppeteer's native click
+  // Tag the specific page number link so we can find it with an ElementHandle
   const found = await page.evaluate((target) => {
     document.querySelectorAll("[data-nav-target]").forEach(el => el.removeAttribute("data-nav-target"));
     const links = document.querySelectorAll("a");
@@ -267,12 +267,30 @@ async function goToPage(page: Page, targetPage: number): Promise<boolean> {
     return false;
   }
 
-  // Puppeteer's native click fires real mouse events (mousedown/mouseup/click)
-  // unlike evaluate(() => el.click()) which only fires a synthetic click event.
+  const diagInfo = await page.evaluate(() => {
+    const el = document.querySelector('[data-nav-target="true"]');
+    if (!el) return "element not found";
+    const rect = el.getBoundingClientRect();
+    return `tag=${el.tagName} text="${el.textContent?.trim()}" href="${(el as HTMLAnchorElement).href}" visible=${rect.width > 0 && rect.height > 0} rect=[${Math.round(rect.x)},${Math.round(rect.y)},${Math.round(rect.width)},${Math.round(rect.height)}]`;
+  });
+  log(`[diag] Page link: ${diagInfo}`);
+
+  // Use ElementHandle to avoid "not clickable" errors when the link is
+  // below the viewport. ElementHandle.click() auto-scrolls into view and
+  // fires real mouse events (unlike evaluate(() => el.click()) which only
+  // fires synthetic events that don't trigger jQuery/AJAX handlers).
+  const element = await page.$('[data-nav-target="true"]');
+  if (!element) {
+    log(`Could not get ElementHandle for page ${targetPage}`);
+    return false;
+  }
+
+  await page.evaluate(el => el.scrollIntoView({ block: "center", inline: "center" }), element);
+
   // Promise.all ensures navigation listener is set up BEFORE the click.
   await Promise.all([
     page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15_000 }).catch(() => {}),
-    page.click('[data-nav-target="true"]'),
+    element.click(),
   ]);
   await sleep(1000);
   return true;
