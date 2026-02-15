@@ -213,6 +213,50 @@ async function scrapeCurrentPage(page: Page, pageNum: number): Promise<Slot[]> {
   }, pageNum);
 }
 
+async function clickNextPageLink(page: Page): Promise<boolean> {
+  // Check if a ">" pagination link exists with a real URL (not datepicker)
+  const hasNext = await page.evaluate(() => {
+    const links = document.querySelectorAll("a");
+    for (const link of links) {
+      const href = link.getAttribute("href") || "";
+      const text = link.textContent?.trim() || "";
+      if (text === ">" && href.includes("page=") && !href.startsWith("javascript:")) {
+        return true;
+      }
+    }
+    return false;
+  });
+
+  if (!hasNext) return false;
+
+  // Click it with navigation wait
+  await Promise.all([
+    page.waitForNavigation({ waitUntil: "networkidle2", timeout: 15_000 }),
+    page.evaluate(() => {
+      const links = document.querySelectorAll("a");
+      for (const link of links) {
+        const href = link.getAttribute("href") || "";
+        const text = link.textContent?.trim() || "";
+        if (text === ">" && href.includes("page=") && !href.startsWith("javascript:")) {
+          (link as HTMLElement).click();
+          return;
+        }
+      }
+    }),
+  ]);
+
+  return true;
+}
+
+async function clickToPage(page: Page, targetPage: number): Promise<boolean> {
+  for (let p = 2; p <= targetPage; p++) {
+    const ok = await clickNextPageLink(page);
+    if (!ok) return false;
+    await sleep(1000);
+  }
+  return true;
+}
+
 async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   const seen = new Set<string>();
   const allSlots: Slot[] = [];
@@ -240,10 +284,16 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     log(`  [${tag}] ${s.dateText} | ${s.instructor}`);
   }
 
+  // Click through pagination using actual page links (preserves server session)
   for (let p = 2; p <= MAX_PAGES; p++) {
     try {
-      await page.goto(`${SCHEDULE_URL}&page=${p}`, { waitUntil: "networkidle2", timeout: 15_000 });
+      const hasNext = await clickNextPageLink(page);
+      if (!hasNext) {
+        log(`  No more pagination links after page ${p - 1}. Total pages: ${p - 1}`);
+        break;
+      }
       await sleep(1000);
+
       const pageSlots = await scrapeCurrentPage(page, p);
       const newCount = addSlots(pageSlots);
       log(`── Page ${p}: ${pageSlots.length} slots (${newCount} new, ${allSlots.length} unique total) ──`);
@@ -254,8 +304,8 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
         log(`  [${tag}] ${s.dateText} | ${s.instructor}`);
       }
       if (pageSlots.length === 0) break;
-    } catch {
-      log(`  Page ${p}: failed to load, stopping.`);
+    } catch (err) {
+      log(`  Page ${p}: failed to load, stopping. Error: ${err}`);
       break;
     }
   }
@@ -289,10 +339,16 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
   try {
     log(`Attempting to book: ${slot.dateText} with ${slot.instructor} (pickup: ${pickup})`);
 
-    // Navigate directly to the page containing this slot
-    const url = slot.page > 1 ? `${SCHEDULE_URL}&page=${slot.page}` : SCHEDULE_URL;
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 15_000 });
-    await sleep(2000);
+    // Navigate via session-preserving method: go to schedule tab, then click through pages
+    await navigateToSchedule(page);
+    if (slot.page > 1) {
+      const reached = await clickToPage(page, slot.page);
+      if (!reached) {
+        log(`Could not navigate to page ${slot.page} for booking.`);
+        return false;
+      }
+    }
+    await sleep(1000);
 
     // Find and click the slot link in the table
     const slotClicked = await page.evaluate((targetDate) => {
