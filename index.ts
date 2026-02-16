@@ -226,13 +226,17 @@ async function login(page: Page): Promise<void> {
   await page.type("#username", USERNAME);
   await page.type("#password", PASSWORD);
 
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60_000 }),
-    page.evaluate(() => {
-      const btn = document.querySelector<HTMLButtonElement>("button.green-haze");
-      if (btn) btn.click();
-    }),
-  ]);
+  await page.evaluate(() => {
+    const btn = document.querySelector<HTMLButtonElement>("button.green-haze");
+    if (btn) btn.click();
+  });
+
+  // Wait for login to complete — URL leaves the login page
+  await page.waitForFunction(
+    () => !window.location.href.includes("/Login/"),
+    { timeout: 60_000 }
+  );
+  await ensurePageReady(page);
 
   log("Logged in successfully.");
   await screenshot(page, "01-after-login");
