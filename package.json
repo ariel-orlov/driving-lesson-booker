@@ -7,7 +7,7 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
-    "puppeteer": "^24.0.0"
+    "puppeteer": "24.2.1"
   },
   "devDependencies": {
     "typescript": "^5.7.0"
