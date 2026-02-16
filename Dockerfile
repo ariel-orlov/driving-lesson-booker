@@ -2,6 +2,8 @@ FROM ghcr.io/puppeteer/puppeteer:24.2.1
 
 WORKDIR /app
 
+ENV PUPPETEER_SKIP_DOWNLOAD=true
+
 COPY package.json package-lock.json* ./
 RUN npm ci
 
