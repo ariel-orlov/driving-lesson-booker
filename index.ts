@@ -6,9 +6,6 @@ import fs from "fs";
 // ── Config ──────────────────────────────────────────────────────────────────
 const LOGIN_URL =
   "https://www.tds.ms/CentralizeSP/Student/Login/chelmsfordautoschool";
-const BOOKED_LESSONS_URL =
-  "https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1370551";
-
 const REQUIRED_ENV = ["TDS_USERNAME", "TDS_PASSWORD", "DISCORD_WEBHOOK", "DISCORD_WEBHOOK_IMPORTANT", "DISCORD_WEBHOOK_SCAN"] as const;
 const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
 if (missing.length > 0) {
@@ -27,10 +24,10 @@ const DISCORD_ALERT = process.env.DISCORD_WEBHOOK_IMPORTANT!;
 const DISCORD_SCAN = process.env.DISCORD_WEBHOOK_SCAN!;
 
 // ── Blackout dates (don't book during these ranges) ─────────────────────────
-// Format: [month, startDay, endDay] (month is 1-indexed)
-const BLACKOUT_RANGES: [number, number, number][] = [
-  [2, 17, 23],  // Feb 17-23
-  [4, 18, 27],  // Apr 18-27
+// Format: [year, month, startDay, endDay] (month is 1-indexed)
+const BLACKOUT_RANGES: [number, number, number, number][] = [
+  [2026, 2, 17, 23],  // Feb 17-23, 2026
+  [2026, 4, 18, 27],  // Apr 18-27, 2026
 ];
 
 const MONTH_MAP: Record<string, number> = {
@@ -48,7 +45,7 @@ interface Slot {
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-function parseSlotDate(dateText: string): { dayOfWeek: string; month: number; day: number; hour: number; minute: number } | null {
+function parseSlotDate(dateText: string): { dayOfWeek: string; month: number; day: number; hour: number; minute: number; year: number } | null {
   const match = dateText.match(
     /^(\w+),\s+(\w+)\s+(\d+),\s+(\d{1,2}):(\d{2})\s+(AM|PM)/
   );
@@ -66,22 +63,28 @@ function parseSlotDate(dateText: string): { dayOfWeek: string; month: number; da
   if (ampm === "PM" && hour !== 12) hour += 12;
   if (ampm === "AM" && hour === 12) hour = 0;
 
-  return { dayOfWeek, month, day, hour, minute };
+  // Infer year: site doesn't provide it, so use current year
+  // If the slot is in a past month, assume next year
+  const now = new Date();
+  let year = now.getFullYear();
+  if (month < now.getMonth() + 1) year++;
+
+  return { dayOfWeek, month, day, hour, minute, year };
 }
 
-/** Normalize a date string into a comparable key like "3-3-17-0" (month-day-hour-minute). */
+/** Normalize a date string into a comparable key like "2026-3-3-17-0" (year-month-day-hour-minute). */
 function slotDateKey(dateText: string): string | null {
   const parsed = parseSlotDate(dateText);
   if (!parsed) return null;
-  return `${parsed.month}-${parsed.day}-${parsed.hour}-${parsed.minute}`;
+  return `${parsed.year}-${parsed.month}-${parsed.day}-${parsed.hour}-${parsed.minute}`;
 }
 
 function isBlackedOut(slot: Slot): boolean {
   const parsed = parseSlotDate(slot.dateText);
   if (!parsed) return false;
 
-  for (const [month, startDay, endDay] of BLACKOUT_RANGES) {
-    if (parsed.month === month && parsed.day >= startDay && parsed.day <= endDay) {
+  for (const [year, month, startDay, endDay] of BLACKOUT_RANGES) {
+    if (parsed.year === year && parsed.month === month && parsed.day >= startDay && parsed.day <= endDay) {
       return true;
     }
   }
@@ -161,6 +164,16 @@ async function ensurePageReady(page: Page): Promise<void> {
   throw new Error("Page frame could not recover after 10 attempts");
 }
 
+/** Check if the session has expired (redirected to login page). */
+async function checkSessionExpired(page: Page): Promise<boolean> {
+  const url = page.url();
+  if (url.includes("/Login/")) {
+    log("Session expired — redirected to login page.");
+    return true;
+  }
+  return false;
+}
+
 // ── Discord notifications ──────────────────────────────────────────────────
 
 async function sendDiscord(webhookUrl: string, message: string): Promise<void> {
@@ -185,19 +198,29 @@ async function sendDiscord(webhookUrl: string, message: string): Promise<void> {
   }
 
   for (const chunk of chunks) {
-    try {
-      const resp = await fetch(webhookUrl, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ content: chunk }),
-      });
-      if (!resp.ok && resp.status !== 204) {
-        log(`Discord send failed: ${resp.status}`);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const resp = await fetch(webhookUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ content: chunk }),
+        });
+        if (resp.status === 429) {
+          const retryAfter = parseInt(resp.headers.get("retry-after") || "2", 10);
+          log(`Discord rate limited, retrying in ${retryAfter}s...`);
+          await sleep(retryAfter * 1000);
+          continue;
+        }
+        if (!resp.ok && resp.status !== 204) {
+          log(`Discord send failed: ${resp.status}`);
+        }
+        break; // success or non-retryable error
+      } catch (err) {
+        log(`Discord send error: ${err}`);
+        break;
       }
-      if (chunks.length > 1) await sleep(500); // rate limit
-    } catch (err) {
-      log(`Discord send error: ${err}`);
     }
+    if (chunks.length > 1) await sleep(500); // rate limit
   }
 }
 
@@ -266,28 +289,36 @@ async function navigateToSchedule(page: Page): Promise<void> {
     return null;
   });
 
+  if (await checkSessionExpired(page)) {
+    throw new Error("Session expired before navigating to schedule");
+  }
+
   const schedElement = schedLink.asElement();
-  if (schedElement) {
-    await sleep(300);
-    const box = await schedElement.boundingBox();
-    if (box) {
-      // Set up response listener BEFORE clicking
-      const responsePromise = page.waitForResponse(
-        (resp) => {
-          const u = resp.url();
-          return (u.includes("Lessons") || u.includes("BtwScheduling") || u.includes("Schedule"))
-            && resp.request().resourceType() !== "image";
-        },
-        { timeout: 15_000 },
-      ).catch(() => null);
+  if (!schedElement) {
+    throw new Error("Could not find 'Schedule My Drive' link — page layout may have changed");
+  }
 
-      await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await sleep(300);
+  const box = await schedElement.boundingBox();
+  if (!box) {
+    throw new Error("Could not get bounding box for 'Schedule My Drive' link");
+  }
 
-      const resp = await responsePromise;
-      if (resp) {
-        log(`"Schedule My Drive" XHR: ${resp.status()} ${resp.url().substring(0, 100)}`);
-      }
-    }
+  // Set up response listener BEFORE clicking
+  const responsePromise = page.waitForResponse(
+    (resp) => {
+      const u = resp.url();
+      return (u.includes("Lessons") || u.includes("BtwScheduling") || u.includes("Schedule"))
+        && resp.request().resourceType() !== "image";
+    },
+    { timeout: 15_000 },
+  ).catch(() => null);
+
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+
+  const resp = await responsePromise;
+  if (resp) {
+    log(`"Schedule My Drive" XHR: ${resp.status()} ${resp.url().substring(0, 100)}`);
   }
 
   await page.waitForSelector("table tbody tr", { timeout: 15_000 }).catch(() => {
@@ -356,10 +387,21 @@ async function scrapeBookedLessons(page: Page): Promise<Set<string>> {
     await screenshot(page, "00-my-schedule");
 
     // The "My Schedule" page uses cards (not a table).
-    // Scrape all text from the page and find date patterns like "TUE, MAR 3, 5:00 PM".
-    const bodyText = await page.evaluate(() => document.body.innerText);
+    // Scrape text from the main content area to find date patterns like "TUE, MAR 3, 5:00 PM".
+    const scheduleText = await page.evaluate(() => {
+      // Try scoped selectors first, fall back to body
+      const container = document.querySelector(".schedule-content")
+        || document.querySelector("#schedule-content")
+        || document.querySelector("[class*='schedule']")
+        || document.querySelector("[class*='lesson']")
+        || document.querySelector(".content-body")
+        || document.querySelector("#content")
+        || document.querySelector("main")
+        || document.body;
+      return (container as HTMLElement).innerText;
+    });
     const datePattern = /[A-Z]{3},\s+[A-Z]{3}\s+\d{1,2},\s+\d{1,2}:\d{2}\s+[AP]M/gi;
-    const matches = bodyText.match(datePattern) || [];
+    const matches = scheduleText.match(datePattern) || [];
 
     for (const match of matches) {
       const key = slotDateKey(match);
@@ -466,10 +508,14 @@ async function goToPage(page: Page, targetPage: number): Promise<boolean> {
   let arrived = false;
   for (let i = 0; i < 30; i++) {
     await sleep(500);
-    const cur = await getCurrentPage(page);
-    if (cur === targetPage) {
-      arrived = true;
-      break;
+    try {
+      const cur = await getCurrentPage(page);
+      if (cur === targetPage) {
+        arrived = true;
+        break;
+      }
+    } catch {
+      log(`Frame error while waiting for page ${targetPage}, retrying...`);
     }
   }
 
@@ -527,6 +573,9 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     // Click through pages; re-check maxPage each time in case ">" reveals more
     for (let p = 2; p <= MAX_PAGES; p++) {
       try {
+        if (await checkSessionExpired(page)) {
+          throw new Error("Session expired during pagination");
+        }
         // Re-read maxPage on current page (pagination may show more pages after navigating)
         const currentMax = await getMaxPage(page);
         if (p > currentMax) {
@@ -563,7 +612,7 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
   const blacked = allSlots.filter(s => isBlackedOut(s));
   const months = [...new Set(allSlots.map(s => parseSlotDate(s.dateText)?.month).filter(Boolean))].sort();
   const monthNames = months.map(m => Object.entries(MONTH_MAP).find(([, v]) => v === m)?.[0] ?? "?");
-  log(`Scan done: ${allSlots.length} total across ${monthNames.join("/")} | ${eligible.length} eligible | ${blacked.length} blacked out`);
+  log(`Scan done: ${allSlots.length} total across ${monthNames.join("/")} | ${eligible.length} time-eligible | ${blacked.length} blacked out`);
   for (const s of eligible) {
     const { pickup } = isEligible(s);
     log(`  ✓ ${s.dateText} | ${s.instructor} | ${pickup}`);
@@ -638,9 +687,10 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
         slotClicked = await page.evaluate((targetDate) => {
           const rows = document.querySelectorAll("table tbody tr");
           for (const row of rows) {
-            const firstCell = row.querySelector("td:first-child a");
-            if (firstCell && firstCell.textContent?.trim() === targetDate) {
-              (firstCell as HTMLElement).click();
+            const firstTd = row.querySelector("td:first-child");
+            const clickable = firstTd?.querySelector("a") || firstTd?.querySelector("span") || firstTd?.querySelector("button") || firstTd;
+            if (clickable && firstTd?.textContent?.trim() === targetDate) {
+              (clickable as HTMLElement).click();
               return true;
             }
           }
@@ -718,14 +768,23 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
     log(`Book button: ${bookClicked}`);
     await sleep(4000);
 
-    // Check if booking was successful by looking for confirmation or error
+    // Check if booking was successful — look for confirmation dialogs/alerts first, then body text
     const result = await page.evaluate(() => {
-      const bodyText = document.body.innerText;
-      if (bodyText.includes("successfully") || bodyText.includes("scheduled") || bodyText.includes("confirmed")) {
+      // Check for success indicators in alerts, modals, or status elements first
+      const alertEl = document.querySelector(".alert-success, .success-message, .confirmation, [class*='success']");
+      if (alertEl) return "success";
+
+      const errorEl = document.querySelector(".alert-danger, .alert-error, .error-message, [class*='error']");
+      if (errorEl) return "error: " + (errorEl.textContent?.trim().substring(0, 200) || "unknown error");
+
+      // Fall back to checking text in the main content area (not nav/header/footer)
+      const content = document.querySelector("main, .content, #content, .modal-body, .page-content") || document.body;
+      const text = (content as HTMLElement).innerText;
+      if (text.includes("successfully") || text.includes("has been scheduled") || text.includes("confirmed")) {
         return "success";
       }
-      if (bodyText.includes("error") || bodyText.includes("failed") || bodyText.includes("unavailable")) {
-        return "error: " + bodyText.substring(0, 200);
+      if (text.includes("no longer available") || text.includes("already been taken") || text.includes("unavailable")) {
+        return "error: slot taken";
       }
       return "unknown";
     });
@@ -821,7 +880,7 @@ async function openBrowserAndScan(): Promise<boolean> {
     );
 
     if (slotsToBook.length === 0) {
-      log("No eligible slots right now. Will keep checking...");
+      log("No new bookable slots right now. Will keep checking...");
       return false;
     }
 
