@@ -227,7 +227,7 @@ async function login(page: Page): Promise<void> {
   await page.type("#password", PASSWORD);
 
   await Promise.all([
-    page.waitForNavigation({ waitUntil: "networkidle2", timeout: 30_000 }),
+    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 60_000 }),
     page.evaluate(() => {
       const btn = document.querySelector<HTMLButtonElement>("button.green-haze");
       if (btn) btn.click();
@@ -243,11 +243,11 @@ async function navigateToSchedule(page: Page): Promise<void> {
 
   const url = "https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1";
   try {
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 30_000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
   } catch {
     await sleep(3000);
     await ensurePageReady(page);
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 30_000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
   }
 
   // Click "Schedule My Drive" using trusted mouse click + wait for XHR response
@@ -303,7 +303,7 @@ async function scrapeBookedLessons(page: Page): Promise<Set<string>> {
 
     // Navigate to the scheduling page (same base as available slots)
     const url = "https://www.tds.ms/CentralizeSP/BtwScheduling/Lessons?SchedulingTypeId=-1";
-    await page.goto(url, { waitUntil: "networkidle2", timeout: 30_000 });
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 60_000 });
 
     // Click the "My Schedule" tab using trusted mouse click + wait for XHR
     const mySchedLink = await page.evaluateHandle(() => {
