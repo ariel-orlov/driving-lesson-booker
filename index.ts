@@ -619,16 +619,12 @@ async function scrapeAllSlots(page: Page): Promise<Slot[]> {
     log(`Done: ${allSlots.length} unique slots`);
   }
 
-  // Log summary
+  // Log summary (just counts — detailed breakdown happens after dedup in openBrowserAndScan)
   const eligible = allSlots.filter(s => isEligible(s).eligible);
   const blacked = allSlots.filter(s => isBlackedOut(s));
   const months = [...new Set(allSlots.map(s => parseSlotDate(s.dateText)?.month).filter(Boolean))].sort();
   const monthNames = months.map(m => Object.entries(MONTH_MAP).find(([, v]) => v === m)?.[0] ?? "?");
   log(`Scan done: ${allSlots.length} total across ${monthNames.join("/")} | ${eligible.length} time-eligible | ${blacked.length} blacked out`);
-  for (const s of eligible) {
-    const { pickup } = isEligible(s);
-    log(`  ✓ ${s.dateText} | ${s.instructor} | ${pickup}`);
-  }
 
   return allSlots;
 }
@@ -798,6 +794,9 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
       if (text.includes("no longer available") || text.includes("already been taken") || text.includes("unavailable")) {
         return "error: slot taken";
       }
+      if (text.includes("one") && text.includes("per day") || text.includes("1") && text.includes("per day") || text.includes("already have") || text.includes("limit")) {
+        return "error: day limit";
+      }
       return "unknown";
     });
 
@@ -848,14 +847,38 @@ async function openBrowserAndScan(): Promise<boolean> {
 
     const isAlreadyBooked = (s: Slot) => bookedKeys.has(slotDateKey(s.dateText) ?? "");
 
+    // Collect days that already have a booked in-car lesson
+    const bookedDays = new Set<string>();
+    for (const key of bookedKeys) {
+      // key format: "year-month-day-hour-minute" — extract "year-month-day"
+      const parts = key.split("-");
+      if (parts.length >= 3) bookedDays.add(`${parts[0]}-${parts[1]}-${parts[2]}`);
+    }
+
     const slotsToBook = allSlots
       .map((slot) => ({ slot, ...isEligible(slot) }))
       .filter((s) => s.eligible)
-      .filter((s) => !isAlreadyBooked(s.slot));
+      .filter((s) => !isAlreadyBooked(s.slot))
+      .filter((s) => {
+        // Only 1 in-car lesson per day allowed
+        const parsed = parseSlotDate(s.slot.dateText);
+        if (!parsed) return false;
+        const dayKey = `${parsed.year}-${parsed.month}-${parsed.day}`;
+        return !bookedDays.has(dayKey);
+      });
 
     const alreadyBookedCount = allSlots.filter(s => isEligible(s).eligible && isAlreadyBooked(s)).length;
     const blackoutCount = allSlots.filter(s => isBlackedOut(s)).length;
     const skippedCount = allSlots.length - slotsToBook.length - blackoutCount - alreadyBookedCount;
+
+    // Log detailed breakdown after dedup
+    for (const s of allSlots) {
+      const { eligible, pickup } = isEligible(s);
+      if (!eligible) continue;
+      const booked = isAlreadyBooked(s);
+      const tag = booked ? "📌 BOOKED" : "✅ NEW";
+      log(`  ${tag}: ${s.dateText} | ${s.instructor} | ${pickup}`);
+    }
 
     // Build concise scan summary for log channel
     const months = [...new Set(allSlots.map(s => parseSlotDate(s.dateText)?.month).filter(Boolean))].sort();
@@ -913,11 +936,25 @@ async function openBrowserAndScan(): Promise<boolean> {
 
     let anyBooked = false;
     for (const { slot, pickup } of slotsToBook) {
+      // Skip if we already booked a lesson on this day during this run
+      const parsed = parseSlotDate(slot.dateText);
+      if (parsed) {
+        const dayKey = `${parsed.year}-${parsed.month}-${parsed.day}`;
+        if (bookedDays.has(dayKey)) {
+          log(`Skipping ${slot.dateText} — already have a lesson on this day`);
+          continue;
+        }
+      }
+
       const success = await bookSlot(page, slot, pickup);
       if (success) {
         anyBooked = true;
         const key = slotDateKey(slot.dateText);
         if (key) bookedKeys.add(key);
+        // Track the day so we don't try to book another slot on the same day
+        if (parsed) {
+          bookedDays.add(`${parsed.year}-${parsed.month}-${parsed.day}`);
+        }
         log("Lesson booked successfully!");
         await notifyAlert(
           `✅ **Driving Lesson Booked!**\n\n` +
