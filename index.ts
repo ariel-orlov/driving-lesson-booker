@@ -17,6 +17,7 @@ const USERNAME = process.env.TDS_USERNAME!;
 const PASSWORD = process.env.TDS_PASSWORD!;
 
 const POLL_INTERVAL_MS = 3 * 60_000;
+const SCAN_TIMEOUT_MS = 90_000; // kill scan if it takes longer than 90s
 const MAX_PAGES = 50; // safety cap only (pagination stops naturally when no more pages)
 
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
@@ -132,6 +133,17 @@ function log(msg: string): void {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Race a promise against a timeout. Rejects with a clear error if time runs out. */
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Timeout: ${label} took longer than ${ms / 1000}s`)), ms);
+    promise.then(
+      (val) => { clearTimeout(timer); resolve(val); },
+      (err) => { clearTimeout(timer); reject(err); },
+    );
+  });
 }
 
 // Set SCREENSHOTS=true to enable, SCREENSHOTS=false to disable. Defaults to on when headful, off on server.
@@ -811,11 +823,16 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
 // ── Main loop ───────────────────────────────────────────────────────────────
 
 async function openBrowserAndScan(): Promise<boolean> {
-  const browser = await puppeteer.launch({
-    headless: process.env.HEADLESS !== "false",
-    defaultViewport: { width: 1280, height: 900, deviceScaleFactor: 1 },
-    args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--force-device-scale-factor=1"],
-  });
+  log("Launching browser...");
+  const browser = await withTimeout(
+    puppeteer.launch({
+      headless: process.env.HEADLESS !== "false",
+      defaultViewport: { width: 1280, height: 900, deviceScaleFactor: 1 },
+      args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-dev-shm-usage", "--force-device-scale-factor=1"],
+    }),
+    30_000,
+    "browser launch",
+  );
   activeBrowser = browser;
 
   try {
@@ -921,7 +938,12 @@ async function openBrowserAndScan(): Promise<boolean> {
     return anyBooked;
   } finally {
     activeBrowser = null;
-    await browser.close();
+    try {
+      await withTimeout(browser.close(), 10_000, "browser close");
+    } catch {
+      log("Browser close timed out — force-killing process...");
+      browser.process()?.kill("SIGKILL");
+    }
     log("Browser closed.");
   }
 }
@@ -973,11 +995,17 @@ async function main(): Promise<void> {
   while (true) {
     let booked = false;
     try {
-      booked = await openBrowserAndScan();
+      booked = await withTimeout(openBrowserAndScan(), SCAN_TIMEOUT_MS, "full scan");
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       const stack = err instanceof Error ? err.stack ?? "" : "";
       log(`Error during scan: ${msg}`);
+      // Force-kill any lingering browser process on timeout
+      if (activeBrowser) {
+        log("Killing lingering browser after scan error...");
+        activeBrowser.process()?.kill("SIGKILL");
+        activeBrowser = null;
+      }
       await notifyAlert(
         `🚨 **Scan Error**\n\nError: ${msg}\n\nStack:\n\`\`\`\n${stack.substring(0, 500)}\n\`\`\`\nTime: ${new Date().toLocaleString("en-US")}`
       );
