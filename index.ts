@@ -127,6 +127,21 @@ function timestamp(): string {
   return new Date().toLocaleTimeString("en-US", { hour12: true });
 }
 
+/** Human-readable countdown from now to a slot date (e.g. "13d 23h"). */
+function timeUntilSlot(dateText: string): string {
+  const parsed = parseSlotDate(dateText);
+  if (!parsed) return "";
+  const now = new Date();
+  const target = new Date(parsed.year, parsed.month - 1, parsed.day, parsed.hour, parsed.minute);
+  const diffMs = target.getTime() - now.getTime();
+  if (diffMs <= 0) return "now";
+  const days = Math.floor(diffMs / 86400_000);
+  const hours = Math.floor((diffMs % 86400_000) / 3600_000);
+  if (days > 0) return `${days}d ${hours}h`;
+  const mins = Math.floor((diffMs % 3600_000) / 60_000);
+  return `${hours}h ${mins}m`;
+}
+
 function log(msg: string): void {
   console.log(`[${timestamp()}] ${msg}`);
 }
@@ -435,16 +450,52 @@ async function scrapeBookedLessons(page: Page): Promise<Set<string>> {
   return bookedKeys;
 }
 
+// ── Available Open Slots table targeting ──────────────────────────────────
+// The page has MULTIPLE tables (My Schedule, calendar datepicker, Available Open Slots).
+// We target the correct one by checking headers: has "Date" but NOT "Starts in" or "Cancel".
+//
+// The findSlotsTable() function is duplicated inside each page.evaluate() call because
+// Puppeteer serializes the function body and cannot capture outer-scope references.
+// If you change the heuristic, search for "findSlotsTable" and update ALL copies.
+
 async function scrapeCurrentPage(page: Page, pageNum: number): Promise<Slot[]> {
   return page.evaluate((pn) => {
-    const rows = document.querySelectorAll("table tbody tr");
+    // -- findSlotsTable (see note above) --
+    function findSlotsTable(): HTMLTableElement | null {
+      const tables = document.querySelectorAll("table");
+      for (const table of tables) {
+        const ths = Array.from(table.querySelectorAll("thead th"));
+        const headers = ths.map(th => (th.textContent || "").trim().toLowerCase());
+        if (headers.some(h => h === "date") &&
+            !headers.some(h => h.includes("starts in")) &&
+            !headers.some(h => h === "cancel")) {
+          return table;
+        }
+      }
+      return null;
+    }
+
+    const targetTable = findSlotsTable();
+    if (!targetTable) return []; // Don't fall back to unscoped scraping
+
+    // Find instructor column from this table's headers
+    let instructorCol = 1;
+    const ths = Array.from(targetTable.querySelectorAll("thead th"));
+    for (let i = 0; i < ths.length; i++) {
+      if ((ths[i].textContent || "").trim().toLowerCase().includes("instructor")) {
+        instructorCol = i;
+        break;
+      }
+    }
+
+    const rows = targetTable.querySelectorAll("tbody tr");
     const slots: { dateText: string; instructor: string; rowIndex: number; page: number }[] = [];
 
     rows.forEach((row, idx) => {
       const cells = row.querySelectorAll("td");
       if (cells.length >= 2) {
         const dateText = cells[0]?.textContent?.trim() ?? "";
-        const instructor = cells[1]?.textContent?.trim() ?? "";
+        const instructor = cells[instructorCol]?.textContent?.trim() ?? "";
         if (dateText && /^\w{3},\s+\w{3}\s+\d/.test(dateText)) {
           slots.push({ dateText, instructor, rowIndex: idx, page: pn });
         }
@@ -658,23 +709,47 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
     // Navigate to schedule list
     await navigateToSchedule(page);
 
-    // Find and click the slot link — check page 1 first, then paginate
+    // Find and click the slot link — check page 1 first, then paginate.
+    // Uses consistent table-finding logic (see findSlotsTable note above scrapeCurrentPage).
     let slotClicked = false;
 
-    // Try page 1 (already loaded in DOM)
-    slotClicked = await page.evaluate((targetDate) => {
-      const rows = document.querySelectorAll("table tbody tr");
-      for (const row of rows) {
-        const firstTd = row.querySelector("td:first-child");
-        const clickable = firstTd?.querySelector("a") || firstTd?.querySelector("span") || firstTd?.querySelector("button") || firstTd;
-        if (clickable && firstTd?.textContent?.trim() === targetDate) {
-          (clickable as HTMLElement).click();
-          return true;
+    async function clickSlotOnCurrentPage(targetDate: string): Promise<boolean> {
+      return page.evaluate((td) => {
+        // -- findSlotsTable (see note above scrapeCurrentPage) --
+        function findSlotsTable(): HTMLTableElement | null {
+          const tables = document.querySelectorAll("table");
+          for (const table of tables) {
+            const ths = Array.from(table.querySelectorAll("thead th"));
+            const headers = ths.map(th => (th.textContent || "").trim().toLowerCase());
+            if (headers.some(h => h === "date") &&
+                !headers.some(h => h.includes("starts in")) &&
+                !headers.some(h => h === "cancel")) {
+              return table;
+            }
+          }
+          return null;
         }
-      }
-      return false;
-    }, slot.dateText);
 
+        const targetTable = findSlotsTable();
+        if (!targetTable) return false;
+
+        const rows = targetTable.querySelectorAll("tbody tr");
+        for (const row of rows) {
+          const firstTd = row.querySelector("td:first-child");
+          if (!firstTd || firstTd.textContent?.trim() !== td) continue;
+          const clickable = firstTd.querySelector("a") || firstTd.querySelector("span") ||
+                            firstTd.querySelector("button") || firstTd;
+          if (clickable) {
+            (clickable as HTMLElement).click();
+            return true;
+          }
+        }
+        return false;
+      }, targetDate);
+    }
+
+    // Try page 1 (already loaded in DOM)
+    slotClicked = await clickSlotOnCurrentPage(slot.dateText);
     if (slotClicked) {
       log(`Found slot on page 1: ${slot.dateText}`);
     }
@@ -683,7 +758,6 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
     if (!slotClicked) {
       const bookMaxPage = await getMaxPage(page);
 
-      // Try the slot's known page first, then other pages
       const pagesToTry = slot.page > 1
         ? [slot.page, ...Array.from({ length: bookMaxPage }, (_, i) => i + 1).filter(p => p !== slot.page && p !== 1)]
         : Array.from({ length: bookMaxPage - 1 }, (_, i) => i + 2);
@@ -692,19 +766,7 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
         const navigated = await goToPage(page, p);
         if (!navigated) continue;
 
-        slotClicked = await page.evaluate((targetDate) => {
-          const rows = document.querySelectorAll("table tbody tr");
-          for (const row of rows) {
-            const firstTd = row.querySelector("td:first-child");
-            const clickable = firstTd?.querySelector("a") || firstTd?.querySelector("span") || firstTd?.querySelector("button") || firstTd;
-            if (clickable && firstTd?.textContent?.trim() === targetDate) {
-              (clickable as HTMLElement).click();
-              return true;
-            }
-          }
-          return false;
-        }, slot.dateText);
-
+        slotClicked = await clickSlotOnCurrentPage(slot.dateText);
         if (slotClicked) {
           log(`Found slot on page ${p}: ${slot.dateText}`);
           break;
@@ -754,16 +816,39 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
     if (!radioSelected) log("Warning: no radio button found for pickup");
     await sleep(1000);
 
-    // Click "Schedule Lesson" button - try multiple selectors
+    // Click the booking confirmation button.
+    // Be specific to avoid clicking navigation elements like "SCHEDULE MY DRIVE" tab.
     const bookClicked = await page.evaluate(() => {
-      // Try exact text match
       const buttons = document.querySelectorAll("button, input[type='submit'], input[type='button'], a.btn");
+      const candidates: { el: HTMLElement; text: string; priority: number }[] = [];
+
       for (const btn of buttons) {
         const text = btn.textContent?.trim() || (btn as HTMLInputElement).value || "";
-        if (text.includes("Schedule") || text.includes("Book") || text.includes("Confirm") || text.includes("Submit")) {
-          (btn as HTMLElement).click();
-          return `Clicked: "${text}"`;
+        const lower = text.toLowerCase();
+
+        // Skip navigation tabs and links
+        if (lower === "schedule my drive" || lower === "my schedule" ||
+            lower === "refine search" || lower === "clear search" ||
+            lower === "close") {
+          continue;
         }
+
+        // High priority: exact booking phrases
+        if (lower === "schedule lesson" || lower === "book lesson" ||
+            lower === "confirm booking" || lower === "submit") {
+          candidates.push({ el: btn as HTMLElement, text, priority: 1 });
+        }
+        // Medium priority: contains booking-related words (but not tab names)
+        else if ((lower.includes("schedule") || lower.includes("book") ||
+                  lower.includes("confirm")) && !lower.includes("my drive")) {
+          candidates.push({ el: btn as HTMLElement, text, priority: 2 });
+        }
+      }
+
+      candidates.sort((a, b) => a.priority - b.priority);
+      if (candidates.length > 0) {
+        candidates[0].el.click();
+        return `Clicked: "${candidates[0].text}"`;
       }
       return null;
     });
@@ -804,12 +889,31 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
     await screenshot(page, "05-booking-result");
 
     if (result === "success") {
+      // Double-check: verify this isn't a false positive by confirming we're NOT
+      // still on the schedule listing page.
+      const stillOnSchedule = await page.evaluate(() => {
+        const t = document.body.innerText.toLowerCase();
+        return t.includes("available open slots") && t.includes("filter by date");
+      });
+      if (stillOnSchedule) {
+        log(`FALSE POSITIVE: "success" detected but still on schedule page. Not booked.`);
+        await screenshot(page, "05-false-positive");
+        return false;
+      }
       log(`BOOKED: ${slot.dateText} with ${slot.instructor} (pickup: ${pickup})`);
       return true;
     }
 
-    log(`Booking may have failed: ${result}`);
+    log(`Booking did not succeed: ${result}`);
     await screenshot(page, "05-booking-failed");
+
+    if (result === "unknown") {
+      await notifyAlert(
+        `❓ **Booking Result Unclear**\n` +
+        `📅 ${slot.dateText} — ${slot.instructor}\n` +
+        `Result was ambiguous. Check screenshots.`
+      );
+    }
     return false;
   } catch (err) {
     log(`Failed to book slot: ${err}`);
@@ -841,6 +945,10 @@ async function openBrowserAndScan(): Promise<boolean> {
     // Scrape already-booked lessons so we don't try to re-book them
     const bookedKeys = await scrapeBookedLessons(page);
 
+    if (bookedKeys.size === 0) {
+      log("WARNING: No booked lessons detected. If lessons ARE booked, the scraper may be broken.");
+    }
+
     await navigateToSchedule(page);
 
     const allSlots = await scrapeAllSlots(page);
@@ -869,7 +977,7 @@ async function openBrowserAndScan(): Promise<boolean> {
 
     const alreadyBookedCount = allSlots.filter(s => isEligible(s).eligible && isAlreadyBooked(s)).length;
     const blackoutCount = allSlots.filter(s => isBlackedOut(s)).length;
-    const skippedCount = allSlots.length - slotsToBook.length - blackoutCount - alreadyBookedCount;
+    const skippedCount = Math.max(0, allSlots.length - slotsToBook.length - blackoutCount - alreadyBookedCount);
 
     // Log detailed breakdown after dedup
     for (const s of allSlots) {
@@ -885,39 +993,64 @@ async function openBrowserAndScan(): Promise<boolean> {
     const monthNames = months.map(m => Object.entries(MONTH_MAP).find(([, v]) => v === m)?.[0] ?? "?");
 
     const eligibleSlotLines = slotsToBook
-      .map(({ slot, pickup }) => `• ${slot.dateText} | ${slot.instructor} | ${pickup}`)
+      .map(({ slot, pickup }) => {
+        const countdown = timeUntilSlot(slot.dateText);
+        return `• ${slot.dateText} — ${slot.instructor} → ${pickup}${countdown ? ` (${countdown})` : ""}`;
+      })
       .join("\n");
 
     const scanMsg = [
-      `📋 **Scan Complete** — ${new Date().toLocaleString("en-US")}`,
-      ``,
-      `**Months:** ${monthNames.join(", ") || "none"}`,
-      `**Total:** ${allSlots.length} | **Eligible:** ${slotsToBook.length} | **Already booked:** ${alreadyBookedCount} | **Blacked out:** ${blackoutCount} | **Skipped:** ${skippedCount}`,
-      ``,
+      `📋 **Scan** — ${new Date().toLocaleString("en-US")}`,
+      `${allSlots.length} slots | ${slotsToBook.length} new | ${alreadyBookedCount} booked | ${blackoutCount} blacked out | ${skippedCount} skipped`,
       slotsToBook.length > 0
-        ? `**Eligible slots:**\n${eligibleSlotLines}`
-        : `No eligible slots found.`,
+        ? `\n**New eligible:**\n${eligibleSlotLines}`
+        : `No new eligible slots.`,
     ].join("\n");
 
     await notifyLog(scanMsg);
 
-    // Scan completion — full list of every slot found
-    const allSlotLines = allSlots
-      .map((slot) => {
-        const { eligible, pickup } = isEligible(slot);
-        const alreadyBooked = eligible && isAlreadyBooked(slot);
-        const tag = isBlackedOut(slot) ? "🚫" : alreadyBooked ? "📌" : eligible ? "✅" : "⏭️";
-        const suffix = alreadyBooked ? " | already booked" : eligible ? ` | ${pickup}` : "";
-        return `${tag} ${slot.dateText} | ${slot.instructor}${suffix}`;
-      })
-      .join("\n");
+    // Scan channel — full list grouped by status
+    const groupedLines: { booked: string[]; eligible: string[]; blacked: string[]; skipped: string[] } = {
+      booked: [], eligible: [], blacked: [], skipped: [],
+    };
 
-    await notifyScan(
-      `📋 **Scan Complete** — ${new Date().toLocaleString("en-US")}\n` +
-      `**${allSlots.length}** slots across **${monthNames.join(", ") || "no months"}** | ` +
-      `${slotsToBook.length} eligible | ${alreadyBookedCount} already booked | ${blackoutCount} blacked out | ${skippedCount} skipped\n\n` +
-      allSlotLines
-    );
+    for (const slot of allSlots) {
+      const { eligible, pickup } = isEligible(slot);
+      const alreadyBooked = eligible && isAlreadyBooked(slot);
+      const countdown = timeUntilSlot(slot.dateText);
+      const countdownStr = countdown ? ` (${countdown})` : "";
+
+      if (isBlackedOut(slot)) {
+        groupedLines.blacked.push(`🚫 ${slot.dateText} — ${slot.instructor}`);
+      } else if (alreadyBooked) {
+        groupedLines.booked.push(`📌 ${slot.dateText} — ${slot.instructor}${countdownStr}`);
+      } else if (eligible) {
+        groupedLines.eligible.push(`✅ ${slot.dateText} — ${slot.instructor} → ${pickup}${countdownStr}`);
+      } else {
+        groupedLines.skipped.push(`⏭️ ${slot.dateText} — ${slot.instructor}`);
+      }
+    }
+
+    const scanLines = [
+      `📋 **Scan** — ${new Date().toLocaleString("en-US")}`,
+      `${allSlots.length} slots | ${monthNames.join(", ") || "none"}`,
+      ``,
+    ];
+
+    if (groupedLines.eligible.length > 0) {
+      scanLines.push(`**NEW (${groupedLines.eligible.length}):**`, ...groupedLines.eligible, ``);
+    }
+    if (groupedLines.booked.length > 0) {
+      scanLines.push(`**Already Booked (${groupedLines.booked.length}):**`, ...groupedLines.booked, ``);
+    }
+    if (groupedLines.blacked.length > 0) {
+      scanLines.push(`**Blacked Out (${groupedLines.blacked.length}):**`, ...groupedLines.blacked, ``);
+    }
+    if (groupedLines.skipped.length > 0) {
+      scanLines.push(`*${groupedLines.skipped.length} ineligible slots omitted*`);
+    }
+
+    await notifyScan(scanLines.join("\n"));
 
     if (slotsToBook.length === 0) {
       log("No new bookable slots right now. Will keep checking...");
@@ -925,13 +1058,16 @@ async function openBrowserAndScan(): Promise<boolean> {
     }
 
     // Alert on important channel when eligible slots are found
-    const eligibleLines = slotsToBook
-      .map(({ slot, pickup }) => `• ${slot.dateText} | ${slot.instructor} | pickup: ${pickup}`)
+    const alertLines = slotsToBook
+      .map(({ slot, pickup }) => {
+        const countdown = timeUntilSlot(slot.dateText);
+        return `• ${slot.dateText} — ${slot.instructor} → ${pickup}${countdown ? ` (${countdown})` : ""}`;
+      })
       .join("\n");
 
     await notifyAlert(
-      `🔔 **${slotsToBook.length} Eligible Slot${slotsToBook.length > 1 ? "s" : ""} Found!**\n` +
-      `Attempting to book...\n\n${eligibleLines}`
+      `🔔 **${slotsToBook.length} New Slot${slotsToBook.length > 1 ? "s" : ""} Found!**\n` +
+      `Attempting to book...\n\n${alertLines}`
     );
 
     let anyBooked = false;
@@ -956,18 +1092,19 @@ async function openBrowserAndScan(): Promise<boolean> {
           bookedDays.add(`${parsed.year}-${parsed.month}-${parsed.day}`);
         }
         log("Lesson booked successfully!");
+        const countdown = timeUntilSlot(slot.dateText);
         await notifyAlert(
           `✅ **Driving Lesson Booked!**\n\n` +
           `📅 ${slot.dateText}\n` +
-          `👤 Instructor: ${slot.instructor}\n` +
+          `👤 ${slot.instructor}\n` +
           `📍 Pickup: ${pickup}\n` +
+          `⏳ ${countdown}\n` +
           `🕐 ${new Date().toLocaleString("en-US")}`
         );
       } else {
         await notifyAlert(
           `⚠️ **Booking Failed**\n` +
-          `📅 ${slot.dateText}\n` +
-          `👤 ${slot.instructor}\n` +
+          `📅 ${slot.dateText} — ${slot.instructor}\n` +
           `Slot may have been taken.`
         );
       }
