@@ -994,9 +994,10 @@ async function openBrowserAndScan(): Promise<boolean> {
     }
 
     // Build heartbeat one-liner for log channel
-    const scanMsg =
-      `🔄 Scanned ${new Date().toLocaleString("en-US")} — ` +
-      `${allSlots.length} slots | ${slotsToBook.length} new | ${alreadyBookedCount} booked | ${blackoutCount} blacked out`;
+    const modeTag = atCap ? "notify-only" : "booking";
+    const scanMsg = atCap
+      ? `👀 Scanned ${new Date().toLocaleString("en-US")} (${modeTag}) — ${allSlots.length} slots | ${alreadyBookedCount} booked`
+      : `🔄 Scanned ${new Date().toLocaleString("en-US")} (${modeTag}) — ${allSlots.length} slots | ${slotsToBook.length} new | ${alreadyBookedCount} booked | ${blackoutCount} blacked out`;
 
     await notifyLog(scanMsg);
 
@@ -1026,7 +1027,7 @@ async function openBrowserAndScan(): Promise<boolean> {
     const monthNames = months.map(m => Object.entries(MONTH_MAP).find(([, v]) => v === m)?.[0] ?? "?");
 
     const scanLines = [
-      `📋 **Scan** — ${new Date().toLocaleString("en-US")}`,
+      `📋 **Scan (${atCap ? "Notify-Only" : "Booking"})** — ${new Date().toLocaleString("en-US")}`,
       `${allSlots.length} slots | ${monthNames.join(", ") || "none"}`,
       ``,
     ];
@@ -1186,10 +1187,19 @@ async function main(): Promise<void> {
   log("Starting driving lesson booker...");
 
   await notifyAlert(
-    `🟢 **Driving Booker Started**\nPolling every ${POLL_INTERVAL_MS / 60_000} minutes.` +
-    `\nBlackout dates: Feb 17-23, Apr 18-27` +
-    `\nBooking cap: 1 lesson (Mar/Apr only — no May+). Notify-only after that.` +
-    `\nTime: ${new Date().toLocaleString("en-US")}`
+    NOTIFY_ONLY_MODE
+      ? `🟢 **Driving Booker Started — Notify-Only Mode**\n` +
+        `Scanning all dates & months. Alerting on open slots that match:\n` +
+        `• Weekends: any time\n` +
+        `• Weekdays: 3:00 PM or later\n` +
+        `Polling every ${POLL_INTERVAL_MS / 60_000} min + extra checks at :00:05 and :30:05\n` +
+        `Time: ${new Date().toLocaleString("en-US")}`
+      : `🟢 **Driving Booker Started — Booking Mode**\n` +
+        `Seeking Mar/Apr slots (weekdays 3 PM+, weekends any time). Cap: 1 lesson.\n` +
+        `Blackout dates: Feb 17-23, Apr 18-27\n` +
+        `Switches to notify-only after booking 1 lesson.\n` +
+        `Polling every ${POLL_INTERVAL_MS / 60_000} min + extra checks at :00:05 and :30:05\n` +
+        `Time: ${new Date().toLocaleString("en-US")}`
   );
 
   let hourEdgePending = false;
