@@ -126,7 +126,11 @@ function isEligible(slot: Slot, ignoreBlackout = false): { eligible: boolean; pi
 }
 
 function timestamp(): string {
-  return new Date().toLocaleTimeString("en-US", { hour12: true });
+  return new Date().toLocaleTimeString("en-US", { hour12: true, timeZone: "America/New_York" });
+}
+
+function nowEST(): string {
+  return new Date().toLocaleString("en-US", { timeZone: "America/New_York" });
 }
 
 /** Human-readable countdown from now to a slot date (e.g. "13d 23h"). */
@@ -993,11 +997,22 @@ async function openBrowserAndScan(): Promise<boolean> {
       log(`  ${tag}: ${s.dateText} | ${s.instructor} | ${pickup}`);
     }
 
-    // Build heartbeat one-liner for log channel
-    const modeTag = atCap ? "notify-only" : "booking";
-    const scanMsg = atCap
-      ? `👀 Scanned ${new Date().toLocaleString("en-US")} (${modeTag}) — ${allSlots.length} slots | ${alreadyBookedCount} booked`
-      : `🔄 Scanned ${new Date().toLocaleString("en-US")} (${modeTag}) — ${allSlots.length} slots | ${slotsToBook.length} new | ${alreadyBookedCount} booked | ${blackoutCount} blacked out`;
+    // Build full flat list of every slot checked for log channel
+    const modeTag = atCap ? "Notify-Only" : "Booking";
+    const allSlotLines = allSlots.map((s) => {
+      const { eligible, pickup } = isEligible(s, atCap); // use notify-only criteria when at cap
+      const booked = isAlreadyBooked(s);
+      const countdown = timeUntilSlot(s.dateText);
+      const countdownStr = countdown ? ` (${countdown})` : "";
+      if (isBlackedOut(s))      return `🚫 ${s.dateText} — ${s.instructor} (blackout)`;
+      if (booked)               return `📌 ${s.dateText} — ${s.instructor}${countdownStr} (booked)`;
+      if (eligible)             return `✅ ${s.dateText} — ${s.instructor} → ${pickup}${countdownStr}`;
+                                return `⏭️ ${s.dateText} — ${s.instructor} (ineligible)`;
+    });
+    const scanMsg = [
+      `${atCap ? "👀" : "🔄"} **All ${allSlots.length} Slots Checked (${modeTag})** — ${nowEST()}`,
+      ...allSlotLines,
+    ].join("\n");
 
     await notifyLog(scanMsg);
 
@@ -1027,7 +1042,7 @@ async function openBrowserAndScan(): Promise<boolean> {
     const monthNames = months.map(m => Object.entries(MONTH_MAP).find(([, v]) => v === m)?.[0] ?? "?");
 
     const scanLines = [
-      `📋 **Scan (${atCap ? "Notify-Only" : "Booking"})** — ${new Date().toLocaleString("en-US")}`,
+      `📋 **Scan (${atCap ? "Notify-Only" : "Booking"})** — ${nowEST()}`,
       `${allSlots.length} slots | ${monthNames.join(", ") || "none"}`,
       ``,
     ];
@@ -1131,7 +1146,7 @@ async function openBrowserAndScan(): Promise<boolean> {
           `👤 ${slot.instructor}\n` +
           `📍 Pickup: ${pickup}\n` +
           `⏳ ${countdown}\n` +
-          `🕐 ${new Date().toLocaleString("en-US")}`
+          `🕐 ${nowEST()}`
         );
       } else {
         await notifyAlert(
@@ -1172,7 +1187,7 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("unhandledRejection", (reason) => {
   const msg = reason instanceof Error ? reason.message : String(reason);
   log(`Unhandled rejection: ${msg}`);
-  sendDiscord(DISCORD_ALERT, `💀 **Unhandled Rejection**\n${msg}\nTime: ${new Date().toLocaleString("en-US")}`).finally(() => process.exit(1));
+  sendDiscord(DISCORD_ALERT, `💀 **Unhandled Rejection**\n${msg}\nTime: ${nowEST()}`).finally(() => process.exit(1));
 });
 
 async function main(): Promise<void> {
@@ -1193,20 +1208,20 @@ async function main(): Promise<void> {
         `• Weekends: any time\n` +
         `• Weekdays: 3:00 PM or later\n` +
         `Polling every ${POLL_INTERVAL_MS / 60_000} min + extra checks at :00:05 and :30:05\n` +
-        `Time: ${new Date().toLocaleString("en-US")}`
+        `Time: ${nowEST()}`
       : `🟢 **Driving Booker Started — Booking Mode**\n` +
         `Seeking Mar/Apr slots (weekdays 3 PM+, weekends any time). Cap: 1 lesson.\n` +
         `Blackout dates: Feb 17-23, Apr 18-27\n` +
         `Switches to notify-only after booking 1 lesson.\n` +
         `Polling every ${POLL_INTERVAL_MS / 60_000} min + extra checks at :00:05 and :30:05\n` +
-        `Time: ${new Date().toLocaleString("en-US")}`
+        `Time: ${nowEST()}`
   );
 
   let hourEdgePending = false;
   function scheduleHourEdgeCheck() {
     const ms = msUntilNextHourEdge();
     const nextTime = new Date(Date.now() + ms);
-    log(`Next hour-edge check at ${nextTime.toLocaleTimeString("en-US")} (in ${Math.round(ms / 1000)}s)`);
+    log(`Next hour-edge check at ${nextTime.toLocaleTimeString("en-US", { timeZone: "America/New_York" })} (in ${Math.round(ms / 1000)}s)`);
     setTimeout(() => {
       hourEdgePending = true;
     }, ms);
@@ -1231,7 +1246,7 @@ async function main(): Promise<void> {
       // Strip file paths from stack before sending to Discord
       const safeStack = stack.replace(/\(.*?:\d+:\d+\)/g, "").substring(0, 400);
       await notifyAlert(
-        `🚨 **Scan Error**\n\nError: ${msg}\n\nStack:\n\`\`\`\n${safeStack}\n\`\`\`\nTime: ${new Date().toLocaleString("en-US")}`
+        `🚨 **Scan Error**\n\nError: ${msg}\n\nStack:\n\`\`\`\n${safeStack}\n\`\`\`\nTime: ${nowEST()}`
       );
     }
 
@@ -1259,6 +1274,6 @@ async function main(): Promise<void> {
 main().catch(async (err) => {
   console.error("Fatal error:", err);
   const msg = err instanceof Error ? err.message : String(err);
-  await notifyAlert(`💀 **Fatal Crash**\n\n${msg}\n\nTime: ${new Date().toLocaleString("en-US")}`);
+  await notifyAlert(`💀 **Fatal Crash**\n\n${msg}\n\nTime: ${nowEST()}`);
   process.exit(1);
 });
