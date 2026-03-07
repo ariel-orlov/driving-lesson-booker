@@ -687,8 +687,8 @@ function msUntilNextHourEdge(): number {
 
   const currentMs = (min * 60 + sec) * 1000 + ms;
 
-  const target1 = (0 * 60 + 5) * 1000;
-  const target2 = (30 * 60 + 5) * 1000;
+  const target1 = 5 * 1_000;           // :00:05 — 5s after the hour
+  const target2 = (30 * 60 + 5) * 1_000; // :30:05 — 5s after the half-hour
   const hourMs = 60 * 60 * 1000;
 
   const candidates = [
@@ -1051,11 +1051,6 @@ async function openBrowserAndScan(): Promise<boolean> {
 
     await notifyScan(scanLines.join("\n"));
 
-    if (slotsToBook.length === 0) {
-      log("No new bookable slots right now. Will keep checking...");
-      return false;
-    }
-
     // If we've already booked 1 this session, switch to notify-only (all months, no blackout filter)
     if (sessionBookedCount >= 1) {
       log(`Notify-only mode (booked ${sessionBookedCount} this session). Alerting about open slots.`);
@@ -1074,6 +1069,11 @@ async function openBrowserAndScan(): Promise<boolean> {
       await notifyAlert(
         `👀 **${notifySlots.length} Open Slot${notifySlots.length > 1 ? "s" : ""} Available** (notify-only)\n\n${lines}`
       );
+      return false;
+    }
+
+    if (slotsToBook.length === 0) {
+      log("No new bookable slots right now. Will keep checking...");
       return false;
     }
 
@@ -1174,15 +1174,19 @@ async function shutdown(signal: string): Promise<void> {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("unhandledRejection", (reason) => {
-  log(`Unhandled rejection: ${reason}`);
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  log(`Unhandled rejection: ${msg}`);
+  sendDiscord(DISCORD_ALERT, `💀 **Unhandled Rejection**\n${msg}\nTime: ${new Date().toLocaleString("en-US")}`).finally(() => process.exit(1));
 });
 
 async function main(): Promise<void> {
   const port = process.env.PORT || 3000;
-  http.createServer((_req, res) => {
+  const server = http.createServer((_req, res) => {
     res.writeHead(200);
     res.end("running");
-  }).listen(port, () => log(`Health server listening on port ${port}`));
+  });
+  server.on("error", (err) => log(`Health server error: ${err.message}`));
+  server.listen(port, () => log(`Health server listening on port ${port}`));
 
   log("Starting driving lesson booker...");
 
@@ -1219,8 +1223,10 @@ async function main(): Promise<void> {
         activeBrowser.process()?.kill("SIGKILL");
         activeBrowser = null;
       }
+      // Strip file paths from stack before sending to Discord
+      const safeStack = stack.replace(/\(.*?:\d+:\d+\)/g, "").substring(0, 400);
       await notifyAlert(
-        `🚨 **Scan Error**\n\nError: ${msg}\n\nStack:\n\`\`\`\n${stack.substring(0, 500)}\n\`\`\`\nTime: ${new Date().toLocaleString("en-US")}`
+        `🚨 **Scan Error**\n\nError: ${msg}\n\nStack:\n\`\`\`\n${safeStack}\n\`\`\`\nTime: ${new Date().toLocaleString("en-US")}`
       );
     }
 
