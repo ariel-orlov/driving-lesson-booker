@@ -19,6 +19,7 @@ const PASSWORD = process.env.TDS_PASSWORD!;
 const POLL_INTERVAL_MS = 3 * 60_000;
 const SCAN_TIMEOUT_MS = 90_000; // kill scan if it takes longer than 90s
 const MAX_PAGES = 50; // safety cap only (pagination stops naturally when no more pages)
+const TOTAL_LESSON_CAP = 8; // never book beyond this total (checked against scraped booked count + session count)
 
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
 const DISCORD_ALERT = process.env.DISCORD_WEBHOOK_IMPORTANT!;
@@ -948,6 +949,10 @@ async function openBrowserAndScan(): Promise<boolean> {
       log("WARNING: No booked lessons detected. If lessons ARE booked, the scraper may be broken.");
     }
 
+    // Cap reached if we booked 1 this session OR if scraped future lessons already fill the cap
+    // (scraped count can be TOTAL_LESSON_CAP - 1 when one past lesson has dropped off the schedule)
+    const atCap = sessionBookedCount >= 1 || bookedKeys.size >= TOTAL_LESSON_CAP - 1;
+
     await navigateToSchedule(page);
 
     const allSlots = await scrapeAllSlots(page);
@@ -1051,9 +1056,9 @@ async function openBrowserAndScan(): Promise<boolean> {
 
     await notifyScan(scanLines.join("\n"));
 
-    // If we've already booked 1 this session, switch to notify-only (all months, no blackout filter)
-    if (sessionBookedCount >= 1) {
-      log(`Notify-only mode (booked ${sessionBookedCount} this session). Alerting about open slots.`);
+    // Cap reached: switch to notify-only (all months, no blackout filter)
+    if (atCap) {
+      log(`Notify-only mode (booked ${sessionBookedCount} this session, ${bookedKeys.size} scraped). Alerting about open slots.`);
       const notifySlots = allSlots
         .map((slot) => ({ slot, ...isEligible(slot, true) }))  // ignoreBlackout = true
         .filter((s) => s.eligible)
@@ -1103,8 +1108,8 @@ async function openBrowserAndScan(): Promise<boolean> {
 
     let anyBooked = false;
     for (const { slot, pickup } of slotsToBookFiltered) {
-      if (sessionBookedCount >= 1) {
-        log(`Skipping ${slot.dateText} — already booked 1 lesson this session (cap reached).`);
+      if (atCap) {
+        log(`Skipping ${slot.dateText} — lesson cap reached (${bookedKeys.size} scraped, ${sessionBookedCount} this session).`);
         break;
       }
       // Skip if we already booked a lesson on this day during this run
