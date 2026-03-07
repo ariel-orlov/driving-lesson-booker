@@ -97,8 +97,8 @@ function isWeekend(dayOfWeek: string): boolean {
   return d === "SAT" || d === "SUN";
 }
 
-function isEligible(slot: Slot): { eligible: boolean; pickup: "Home" | "High School" } {
-  if (isBlackedOut(slot)) return { eligible: false, pickup: "Home" };
+function isEligible(slot: Slot, ignoreBlackout = false): { eligible: boolean; pickup: "Home" | "High School" } {
+  if (!ignoreBlackout && isBlackedOut(slot)) return { eligible: false, pickup: "Home" };
 
   const parsed = parseSlotDate(slot.dateText);
   if (!parsed) return { eligible: false, pickup: "Home" };
@@ -1056,17 +1056,23 @@ async function openBrowserAndScan(): Promise<boolean> {
       return false;
     }
 
-    // If we've already booked 1 this session, switch to notify-only (all months)
+    // If we've already booked 1 this session, switch to notify-only (all months, no blackout filter)
     if (sessionBookedCount >= 1) {
       log(`Notify-only mode (booked ${sessionBookedCount} this session). Alerting about open slots.`);
-      const lines = slotsToBook
+      const notifySlots = allSlots
+        .map((slot) => ({ slot, ...isEligible(slot, true) }))  // ignoreBlackout = true
+        .filter((s) => s.eligible)
+        .filter((s) => !isAlreadyBooked(s.slot));
+      if (notifySlots.length === 0) return false;
+      const lines = notifySlots
         .map(({ slot, pickup }) => {
           const countdown = timeUntilSlot(slot.dateText);
-          return `• ${slot.dateText} — ${slot.instructor} → ${pickup}${countdown ? ` (${countdown})` : ""}`;
+          const blackoutTag = isBlackedOut(slot) ? " 🚫blackout" : "";
+          return `• ${slot.dateText} — ${slot.instructor} → ${pickup}${blackoutTag}${countdown ? ` (${countdown})` : ""}`;
         })
         .join("\n");
       await notifyAlert(
-        `👀 **${slotsToBook.length} Open Slot${slotsToBook.length > 1 ? "s" : ""} Available** (notify-only)\n\n${lines}`
+        `👀 **${notifySlots.length} Open Slot${notifySlots.length > 1 ? "s" : ""} Available** (notify-only)\n\n${lines}`
       );
       return false;
     }
