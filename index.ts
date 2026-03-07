@@ -993,24 +993,10 @@ async function openBrowserAndScan(): Promise<boolean> {
       log(`  ${tag}: ${s.dateText} | ${s.instructor} | ${pickup}`);
     }
 
-    // Build concise scan summary for log channel
-    const months = [...new Set(allSlots.map(s => parseSlotDate(s.dateText)?.month).filter(Boolean))].sort();
-    const monthNames = months.map(m => Object.entries(MONTH_MAP).find(([, v]) => v === m)?.[0] ?? "?");
-
-    const eligibleSlotLines = slotsToBook
-      .map(({ slot, pickup }) => {
-        const countdown = timeUntilSlot(slot.dateText);
-        return `• ${slot.dateText} — ${slot.instructor} → ${pickup}${countdown ? ` (${countdown})` : ""}`;
-      })
-      .join("\n");
-
-    const scanMsg = [
-      `📋 **Scan** — ${new Date().toLocaleString("en-US")}`,
-      `${allSlots.length} slots | ${slotsToBook.length} new | ${alreadyBookedCount} booked | ${blackoutCount} blacked out | ${skippedCount} skipped`,
-      slotsToBook.length > 0
-        ? `\n**New eligible:**\n${eligibleSlotLines}`
-        : `No new eligible slots.`,
-    ].join("\n");
+    // Build heartbeat one-liner for log channel
+    const scanMsg =
+      `🔄 Scanned ${new Date().toLocaleString("en-US")} — ` +
+      `${allSlots.length} slots | ${slotsToBook.length} new | ${alreadyBookedCount} booked | ${blackoutCount} blacked out`;
 
     await notifyLog(scanMsg);
 
@@ -1035,6 +1021,9 @@ async function openBrowserAndScan(): Promise<boolean> {
         groupedLines.skipped.push(`⏭️ ${slot.dateText} — ${slot.instructor}`);
       }
     }
+
+    const months = [...new Set(allSlots.map(s => parseSlotDate(s.dateText)?.month).filter(Boolean))].sort();
+    const monthNames = months.map(m => Object.entries(MONTH_MAP).find(([, v]) => v === m)?.[0] ?? "?");
 
     const scanLines = [
       `📋 **Scan** — ${new Date().toLocaleString("en-US")}`,
