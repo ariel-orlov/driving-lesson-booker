@@ -271,10 +271,9 @@ async function login(page: Page): Promise<void> {
 
   await page.waitForSelector("#username", { visible: true, timeout: 15_000 });
 
-  await page.$eval("#username", (el) => ((el as HTMLInputElement).value = ""));
-  await page.$eval("#password", (el) => ((el as HTMLInputElement).value = ""));
-  await page.type("#username", USERNAME);
-  await page.type("#password", PASSWORD);
+  // Use locator.fill() to atomically clear + set — avoids autofill interference corrupting the password
+  await page.locator("#username").fill(USERNAME);
+  await page.locator("#password").fill(PASSWORD);
 
   await page.evaluate(() => {
     const btn = document.querySelector<HTMLButtonElement>("button.green-haze");
@@ -1057,8 +1056,34 @@ async function openBrowserAndScan(): Promise<boolean> {
       return false;
     }
 
+    // If we've already booked 1 this session, switch to notify-only (all months)
+    if (sessionBookedCount >= 1) {
+      log(`Notify-only mode (booked ${sessionBookedCount} this session). Alerting about open slots.`);
+      const lines = slotsToBook
+        .map(({ slot, pickup }) => {
+          const countdown = timeUntilSlot(slot.dateText);
+          return `• ${slot.dateText} — ${slot.instructor} → ${pickup}${countdown ? ` (${countdown})` : ""}`;
+        })
+        .join("\n");
+      await notifyAlert(
+        `👀 **${slotsToBook.length} Open Slot${slotsToBook.length > 1 ? "s" : ""} Available** (notify-only)\n\n${lines}`
+      );
+      return false;
+    }
+
+    // For booking: only attempt Mar/Apr slots (month <= 4)
+    const slotsToBookFiltered = slotsToBook.filter(({ slot }) => {
+      const p = parseSlotDate(slot.dateText);
+      return p && p.month <= 4;
+    });
+
+    if (slotsToBookFiltered.length === 0) {
+      log("No bookable slots in Mar/Apr right now. Will keep watching...");
+      return false;
+    }
+
     // Alert on important channel when eligible slots are found
-    const alertLines = slotsToBook
+    const alertLines = slotsToBookFiltered
       .map(({ slot, pickup }) => {
         const countdown = timeUntilSlot(slot.dateText);
         return `• ${slot.dateText} — ${slot.instructor} → ${pickup}${countdown ? ` (${countdown})` : ""}`;
@@ -1066,12 +1091,16 @@ async function openBrowserAndScan(): Promise<boolean> {
       .join("\n");
 
     await notifyAlert(
-      `🔔 **${slotsToBook.length} New Slot${slotsToBook.length > 1 ? "s" : ""} Found!**\n` +
+      `🔔 **${slotsToBookFiltered.length} New Slot${slotsToBookFiltered.length > 1 ? "s" : ""} Found!**\n` +
       `Attempting to book...\n\n${alertLines}`
     );
 
     let anyBooked = false;
-    for (const { slot, pickup } of slotsToBook) {
+    for (const { slot, pickup } of slotsToBookFiltered) {
+      if (sessionBookedCount >= 1) {
+        log(`Skipping ${slot.dateText} — already booked 1 lesson this session (cap reached).`);
+        break;
+      }
       // Skip if we already booked a lesson on this day during this run
       const parsed = parseSlotDate(slot.dateText);
       if (parsed) {
@@ -1085,6 +1114,7 @@ async function openBrowserAndScan(): Promise<boolean> {
       const success = await bookSlot(page, slot, pickup);
       if (success) {
         anyBooked = true;
+        sessionBookedCount++;
         const key = slotDateKey(slot.dateText);
         if (key) bookedKeys.add(key);
         // Track the day so we don't try to book another slot on the same day
@@ -1124,6 +1154,8 @@ async function openBrowserAndScan(): Promise<boolean> {
 
 // ── Graceful shutdown ──────────────────────────────────────────────────────
 let activeBrowser: Awaited<ReturnType<typeof puppeteer.launch>> | null = null;
+// Cap: book at most 1 more lesson this session; after that switch to notify-only
+let sessionBookedCount = 0;
 
 async function shutdown(signal: string): Promise<void> {
   log(`Received ${signal}, shutting down...`);
@@ -1151,6 +1183,7 @@ async function main(): Promise<void> {
   await notifyAlert(
     `🟢 **Driving Booker Started**\nPolling every ${POLL_INTERVAL_MS / 60_000} minutes.` +
     `\nBlackout dates: Feb 17-23, Apr 18-27` +
+    `\nBooking cap: 1 lesson (Mar/Apr only — no May+). Notify-only after that.` +
     `\nTime: ${new Date().toLocaleString("en-US")}`
   );
 
