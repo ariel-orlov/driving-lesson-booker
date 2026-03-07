@@ -20,6 +20,7 @@ const POLL_INTERVAL_MS = 3 * 60_000;
 const SCAN_TIMEOUT_MS = 90_000; // kill scan if it takes longer than 90s
 const MAX_PAGES = 50; // safety cap only (pagination stops naturally when no more pages)
 const TOTAL_LESSON_CAP = 8; // never book beyond this total (checked against scraped booked count + session count)
+const NOTIFY_ONLY_MODE = process.env.NOTIFY_ONLY === "true"; // set NOTIFY_ONLY=true to disable booking permanently
 
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
 const DISCORD_ALERT = process.env.DISCORD_WEBHOOK_IMPORTANT!;
@@ -951,7 +952,7 @@ async function openBrowserAndScan(): Promise<boolean> {
 
     // Cap reached if we booked 1 this session OR if scraped future lessons already fill the cap
     // (scraped count can be TOTAL_LESSON_CAP - 1 when one past lesson has dropped off the schedule)
-    const atCap = sessionBookedCount >= 1 || bookedKeys.size >= TOTAL_LESSON_CAP - 1;
+    const atCap = NOTIFY_ONLY_MODE || sessionBookedCount >= 1 || bookedKeys.size >= TOTAL_LESSON_CAP - 1;
 
     await navigateToSchedule(page);
 
