@@ -34,7 +34,7 @@ function requireIntEnv(key: string, defaultVal: number, min: number, max: number
   return n;
 }
 
-const TOTAL_LESSON_CAP   = requireIntEnv("TOTAL_LESSON_CAP",   8,  1, 100); // stop booking after this many total lessons
+const TOTAL_LESSON_CAP   = requireIntEnv("TOTAL_LESSON_CAP",   8,  1, 100); // stop booking once this many lessons show in the schedule
 const SESSION_BOOKING_CAP = requireIntEnv("SESSION_BOOKING_CAP", 1,  1, 100); // max new bookings per continuous run
 const BOOKING_MAX_MONTH  = requireIntEnv("BOOKING_MAX_MONTH",   4,  1,  12); // only book slots in months <= this (4=Apr, 12=all)
 
@@ -981,9 +981,8 @@ async function openBrowserAndScan(): Promise<boolean> {
       log("WARNING: No booked lessons detected. If lessons ARE booked, the scraper may be broken.");
     }
 
-    // Cap reached if we booked 1 this session OR if scraped future lessons already fill the cap
-    // (scraped count can be TOTAL_LESSON_CAP - 1 when one past lesson has dropped off the schedule)
-    const atCap = NOTIFY_ONLY_MODE || sessionBookedCount >= SESSION_BOOKING_CAP || bookedKeys.size >= TOTAL_LESSON_CAP - 1;
+    // Cap reached if we booked enough this session OR if the schedule already shows the max number of lessons
+    const atCap = NOTIFY_ONLY_MODE || sessionBookedCount >= SESSION_BOOKING_CAP || bookedKeys.size >= TOTAL_LESSON_CAP;
 
     await navigateToSchedule(page);
 
