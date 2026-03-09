@@ -21,6 +21,10 @@ const SCAN_TIMEOUT_MS = 90_000; // kill scan if it takes longer than 90s
 const MAX_PAGES = 50; // safety cap only (pagination stops naturally when no more pages)
 const TOTAL_LESSON_CAP = 8; // never book beyond this total (checked against scraped booked count + session count)
 const NOTIFY_ONLY_MODE = process.env.NOTIFY_ONLY === "true"; // set NOTIFY_ONLY=true to disable booking permanently
+const BLACKOUT_ENABLED = process.env.BLACKOUT_ENABLED !== "false"; // set BLACKOUT_ENABLED=false to ignore blackout dates
+// Minimum weekday start time for eligibility (HH:MM in 24h). Default 15:00. Set e.g. "17:30" for evenings-only.
+const [WEEKDAY_MIN_HOUR, WEEKDAY_MIN_MINUTE] = (process.env.WEEKDAY_MIN_TIME ?? "15:00").split(":").map(Number);
+const WEEKDAY_MIN_MINUTES = WEEKDAY_MIN_HOUR * 60 + WEEKDAY_MIN_MINUTE;
 
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
 const DISCORD_ALERT = process.env.DISCORD_WEBHOOK_IMPORTANT!;
@@ -83,6 +87,7 @@ function slotDateKey(dateText: string): string | null {
 }
 
 function isBlackedOut(slot: Slot): boolean {
+  if (!BLACKOUT_ENABLED) return false;
   const parsed = parseSlotDate(slot.dateText);
   if (!parsed) return false;
 
@@ -112,17 +117,17 @@ function isEligible(slot: Slot, ignoreBlackout = false): { eligible: boolean; pi
     return { eligible: true, pickup: "Home" };
   }
 
-  // Weekday: 3:00 PM to 3:30 PM (inclusive) → High School
-  if (timeInMinutes >= 15 * 60 && timeInMinutes <= 15 * 60 + 30) {
+  // Weekday: must meet minimum time threshold (configurable via WEEKDAY_MIN_TIME)
+  if (timeInMinutes < WEEKDAY_MIN_MINUTES) {
+    return { eligible: false, pickup: "Home" };
+  }
+
+  // Weekday: 3:00 PM to 3:30 PM (inclusive) → High School (only relevant when min time is 15:00)
+  if (timeInMinutes <= 15 * 60 + 30) {
     return { eligible: true, pickup: "High School" };
   }
 
-  // Weekday: after 3:30 PM → Home
-  if (timeInMinutes > 15 * 60 + 30) {
-    return { eligible: true, pickup: "Home" };
-  }
-
-  return { eligible: false, pickup: "Home" };
+  return { eligible: true, pickup: "Home" };
 }
 
 function timestamp(): string {
@@ -1201,17 +1206,22 @@ async function main(): Promise<void> {
 
   log("Starting driving lesson booker...");
 
+  const weekdayMinLabel = `${String(WEEKDAY_MIN_HOUR).padStart(2, "0")}:${String(WEEKDAY_MIN_MINUTE).padStart(2, "0")}`;
+  const blackoutLabel = BLACKOUT_ENABLED ? "Feb 17-23, Apr 18-27" : "none";
   await notifyAlert(
     NOTIFY_ONLY_MODE
       ? `🟢 **Driving Booker Started — Notify-Only Mode**\n` +
         `Scanning all dates & months. Alerting on open slots that match:\n` +
-        `• Weekends: any time\n` +
-        `• Weekdays: 3:00 PM or later\n` +
+        `• Weekends: any time → Home\n` +
+        `• Weekdays: ${weekdayMinLabel} or later → Home\n` +
+        `• Blackout dates: ${blackoutLabel}\n` +
         `Polling every ${POLL_INTERVAL_MS / 60_000} min + extra checks at :00:05 and :30:05\n` +
         `Time: ${nowEST()}`
       : `🟢 **Driving Booker Started — Booking Mode**\n` +
-        `Seeking Mar/Apr slots (weekdays 3 PM+, weekends any time). Cap: 1 lesson.\n` +
-        `Blackout dates: Feb 17-23, Apr 18-27\n` +
+        `Seeking Mar/Apr slots. Cap: 1 lesson.\n` +
+        `• Weekends: any time → Home\n` +
+        `• Weekdays: ${weekdayMinLabel} or later → Home\n` +
+        `• Blackout dates: ${blackoutLabel}\n` +
         `Switches to notify-only after booking 1 lesson.\n` +
         `Polling every ${POLL_INTERVAL_MS / 60_000} min + extra checks at :00:05 and :30:05\n` +
         `Time: ${nowEST()}`
