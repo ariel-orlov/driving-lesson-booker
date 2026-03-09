@@ -19,11 +19,33 @@ const PASSWORD = process.env.TDS_PASSWORD!;
 const POLL_INTERVAL_MS = 3 * 60_000;
 const SCAN_TIMEOUT_MS = 90_000; // kill scan if it takes longer than 90s
 const MAX_PAGES = 50; // safety cap only (pagination stops naturally when no more pages)
-const TOTAL_LESSON_CAP = 8; // never book beyond this total (checked against scraped booked count + session count)
 const NOTIFY_ONLY_MODE = process.env.NOTIFY_ONLY === "true"; // set NOTIFY_ONLY=true to disable booking permanently
 const BLACKOUT_ENABLED = process.env.BLACKOUT_ENABLED !== "false"; // set BLACKOUT_ENABLED=false to ignore blackout dates
-// Minimum weekday start time for eligibility (HH:MM in 24h). Default 15:00. Set e.g. "17:30" for evenings-only.
-const [WEEKDAY_MIN_HOUR, WEEKDAY_MIN_MINUTE] = (process.env.WEEKDAY_MIN_TIME ?? "15:00").split(":").map(Number);
+
+// Validated numeric config helpers
+function requireIntEnv(key: string, defaultVal: number, min: number, max: number): number {
+  const raw = process.env[key];
+  if (raw === undefined) return defaultVal;
+  const n = parseInt(raw, 10);
+  if (isNaN(n) || n < min || n > max) {
+    console.error(`Invalid ${key}="${raw}": must be an integer between ${min} and ${max}`);
+    process.exit(1);
+  }
+  return n;
+}
+
+const TOTAL_LESSON_CAP   = requireIntEnv("TOTAL_LESSON_CAP",   8,  1, 100); // stop booking after this many total lessons
+const SESSION_BOOKING_CAP = requireIntEnv("SESSION_BOOKING_CAP", 1,  1, 100); // max new bookings per continuous run
+const BOOKING_MAX_MONTH  = requireIntEnv("BOOKING_MAX_MONTH",   4,  1,  12); // only book slots in months <= this (4=Apr, 12=all)
+
+// Minimum weekday start time for eligibility (HH:MM in 24h). Default 15:00.
+const _weekdayTimeParts = (process.env.WEEKDAY_MIN_TIME ?? "15:00").split(":");
+const WEEKDAY_MIN_HOUR   = parseInt(_weekdayTimeParts[0] ?? "15", 10);
+const WEEKDAY_MIN_MINUTE = parseInt(_weekdayTimeParts[1] ?? "0",  10);
+if (isNaN(WEEKDAY_MIN_HOUR) || isNaN(WEEKDAY_MIN_MINUTE) || WEEKDAY_MIN_HOUR < 0 || WEEKDAY_MIN_HOUR > 23 || WEEKDAY_MIN_MINUTE < 0 || WEEKDAY_MIN_MINUTE > 59) {
+  console.error(`Invalid WEEKDAY_MIN_TIME="${process.env.WEEKDAY_MIN_TIME}": expected HH:MM in 24h format (e.g. "15:00" or "17:30")`);
+  process.exit(1);
+}
 const WEEKDAY_MIN_MINUTES = WEEKDAY_MIN_HOUR * 60 + WEEKDAY_MIN_MINUTE;
 
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
@@ -961,7 +983,7 @@ async function openBrowserAndScan(): Promise<boolean> {
 
     // Cap reached if we booked 1 this session OR if scraped future lessons already fill the cap
     // (scraped count can be TOTAL_LESSON_CAP - 1 when one past lesson has dropped off the schedule)
-    const atCap = NOTIFY_ONLY_MODE || sessionBookedCount >= 1 || bookedKeys.size >= TOTAL_LESSON_CAP - 1;
+    const atCap = NOTIFY_ONLY_MODE || sessionBookedCount >= SESSION_BOOKING_CAP || bookedKeys.size >= TOTAL_LESSON_CAP - 1;
 
     await navigateToSchedule(page);
 
@@ -1093,14 +1115,15 @@ async function openBrowserAndScan(): Promise<boolean> {
       return false;
     }
 
-    // For booking: only attempt Mar/Apr slots (month <= 4)
+    // For booking: only attempt slots within the configured month range
     const slotsToBookFiltered = slotsToBook.filter(({ slot }) => {
       const p = parseSlotDate(slot.dateText);
-      return p && p.month <= 4;
+      return p && p.month <= BOOKING_MAX_MONTH;
     });
 
     if (slotsToBookFiltered.length === 0) {
-      log("No bookable slots in Mar/Apr right now. Will keep watching...");
+      const monthLabel = BOOKING_MAX_MONTH < 12 ? `month 1–${BOOKING_MAX_MONTH}` : "any month";
+      log(`No bookable slots in ${monthLabel} right now. Will keep watching...`);
       return false;
     }
 
@@ -1208,6 +1231,7 @@ async function main(): Promise<void> {
 
   const weekdayMinLabel = `${String(WEEKDAY_MIN_HOUR).padStart(2, "0")}:${String(WEEKDAY_MIN_MINUTE).padStart(2, "0")}`;
   const blackoutLabel = BLACKOUT_ENABLED ? "Feb 17-23, Apr 18-27" : "none";
+  const monthRangeLabel = BOOKING_MAX_MONTH >= 12 ? "all months" : `months 1–${BOOKING_MAX_MONTH}`;
   await notifyAlert(
     NOTIFY_ONLY_MODE
       ? `🟢 **Driving Booker Started — Notify-Only Mode**\n` +
@@ -1218,11 +1242,10 @@ async function main(): Promise<void> {
         `Polling every ${POLL_INTERVAL_MS / 60_000} min + extra checks at :00:05 and :30:05\n` +
         `Time: ${nowEST()}`
       : `🟢 **Driving Booker Started — Booking Mode**\n` +
-        `Seeking Mar/Apr slots. Cap: 1 lesson.\n` +
+        `Booking up to ${SESSION_BOOKING_CAP} lesson(s)/run, ${TOTAL_LESSON_CAP} total cap. Range: ${monthRangeLabel}.\n` +
         `• Weekends: any time → Home\n` +
         `• Weekdays: ${weekdayMinLabel} or later → Home\n` +
         `• Blackout dates: ${blackoutLabel}\n` +
-        `Switches to notify-only after booking 1 lesson.\n` +
         `Polling every ${POLL_INTERVAL_MS / 60_000} min + extra checks at :00:05 and :30:05\n` +
         `Time: ${nowEST()}`
   );
