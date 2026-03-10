@@ -922,9 +922,12 @@ async function bookSlot(page: Page, slot: Slot, pickup: "Home" | "High School"):
 
     if (result === "success") {
       // Double-check: verify this isn't a false positive by confirming we're NOT
-      // still on the schedule listing page.
+      // still on the schedule listing page. If a booking confirmation dialog is
+      // visible (modal overlaying the schedule), that counts as a real success.
       const stillOnSchedule = await page.evaluate(() => {
         const t = document.body.innerText.toLowerCase();
+        const hasConfirmationDialog = t.includes("has been scheduled");
+        if (hasConfirmationDialog) return false; // real booking — modal is overlaying the schedule
         return t.includes("available open slots") && t.includes("filter by date");
       });
       if (stillOnSchedule) {
@@ -1141,19 +1144,25 @@ async function openBrowserAndScan(): Promise<boolean> {
 
     let anyBooked = false;
     for (const { slot, pickup } of slotsToBookFiltered) {
-      if (atCap) {
+      // Re-check cap live so it reflects bookings made earlier in this loop
+      if (NOTIFY_ONLY_MODE || sessionBookedCount >= SESSION_BOOKING_CAP || bookedKeys.size >= TOTAL_LESSON_CAP) {
         log(`Skipping ${slot.dateText} — lesson cap reached (${bookedKeys.size} scraped, ${sessionBookedCount} this session).`);
         break;
       }
-      // Skip if we already booked a lesson on this day during this run
+      // Guard: skip slot if date cannot be parsed (avoids bypassing same-day check)
       const parsed = parseSlotDate(slot.dateText);
-      if (parsed) {
-        const dayKey = `${parsed.year}-${parsed.month}-${parsed.day}`;
-        if (bookedDays.has(dayKey)) {
-          log(`Skipping ${slot.dateText} — already have a lesson on this day`);
-          continue;
-        }
+      if (!parsed) {
+        log(`Skipping ${slot.dateText} — could not parse date`);
+        continue;
       }
+      const dayKey = `${parsed.year}-${parsed.month}-${parsed.day}`;
+      if (bookedDays.has(dayKey)) {
+        log(`Skipping ${slot.dateText} — already have a lesson on this day`);
+        continue;
+      }
+      // Mark day immediately so no second slot on the same day is attempted,
+      // regardless of whether this booking succeeds or fails
+      bookedDays.add(dayKey);
 
       const success = await bookSlot(page, slot, pickup);
       if (success) {
@@ -1161,10 +1170,6 @@ async function openBrowserAndScan(): Promise<boolean> {
         sessionBookedCount++;
         const key = slotDateKey(slot.dateText);
         if (key) bookedKeys.add(key);
-        // Track the day so we don't try to book another slot on the same day
-        if (parsed) {
-          bookedDays.add(`${parsed.year}-${parsed.month}-${parsed.day}`);
-        }
         log("Lesson booked successfully!");
         const countdown = timeUntilSlot(slot.dateText);
         await notifyAlert(
