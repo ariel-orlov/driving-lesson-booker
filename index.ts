@@ -47,6 +47,11 @@ if (isNaN(WEEKDAY_MIN_HOUR) || isNaN(WEEKDAY_MIN_MINUTE) || WEEKDAY_MIN_HOUR < 0
   process.exit(1);
 }
 const WEEKDAY_MIN_MINUTES = WEEKDAY_MIN_HOUR * 60 + WEEKDAY_MIN_MINUTE;
+// Specific dates to never book, format "YYYY-M-D" (e.g. "2026-4-25"), comma-separated.
+// Applied regardless of BLACKOUT_ENABLED.
+const SKIP_DATES: Set<string> = new Set(
+  (process.env.SKIP_DATES ?? "").split(",").map(s => s.trim()).filter(Boolean)
+);
 
 const DISCORD_LOG = process.env.DISCORD_WEBHOOK!;
 const DISCORD_ALERT = process.env.DISCORD_WEBHOOK_IMPORTANT!;
@@ -109,9 +114,13 @@ function slotDateKey(dateText: string): string | null {
 }
 
 function isBlackedOut(slot: Slot): boolean {
-  if (!BLACKOUT_ENABLED) return false;
   const parsed = parseSlotDate(slot.dateText);
   if (!parsed) return false;
+
+  // SKIP_DATES always applies regardless of BLACKOUT_ENABLED
+  if (SKIP_DATES.has(`${parsed.year}-${parsed.month}-${parsed.day}`)) return true;
+
+  if (!BLACKOUT_ENABLED) return false;
 
   for (const [year, month, startDay, endDay] of BLACKOUT_RANGES) {
     if (parsed.year === year && parsed.month === month && parsed.day >= startDay && parsed.day <= endDay) {
